@@ -168,7 +168,8 @@ class PRCodeSuggestions:
                     self.progress_response = self.git_provider.publish_comment(self.progress,
                                                                                **self._improve_thread_kwargs())
                 else:
-                    self.git_provider.publish_comment("Preparing suggestions...", is_temporary=True)
+                    self.progress_response = self.git_provider.publish_comment(
+                        "Preparing suggestions...", is_temporary=True)
 
             # # call the model to get the suggestions, and self-reflect on them
             # if not self.is_extended:
@@ -293,6 +294,8 @@ class PRCodeSuggestions:
                 self.git_provider.publish_comment(pr_body, **self._improve_thread_kwargs())
         else:
             get_settings().data = {"artifact": ""}
+            if self.progress_response:
+                self.git_provider.remove_comment(self.progress_response)
 
     async def dual_publishing(self, data):
         data_above_threshold = {'code_suggestions': []}
