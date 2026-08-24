@@ -290,8 +290,14 @@ class PRCodeSuggestions:
             get_logger().debug(f"PR output", artifact=pr_body)
             if self.progress_response:
                 self.git_provider.edit_comment(self.progress_response, body=pr_body)
+                if self._improve_thread_kwargs():
+                    # A mere status message isn't actionable; resolve the thread instead of
+                    # leaving it open for the user to close manually.
+                    self.git_provider.resolve_comment_thread(self.progress_response)
             else:
-                self.git_provider.publish_comment(pr_body, **self._improve_thread_kwargs())
+                comment = self.git_provider.publish_comment(pr_body, **self._improve_thread_kwargs())
+                if comment and self._improve_thread_kwargs():
+                    self.git_provider.resolve_comment_thread(comment)
         else:
             get_settings().data = {"artifact": ""}
             if self.progress_response:
