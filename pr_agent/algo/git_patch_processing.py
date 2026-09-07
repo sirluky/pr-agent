@@ -3,14 +3,28 @@ from __future__ import annotations
 import re
 import traceback
 
-from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
-from pr_agent.config_loader import get_settings
+from pr_agent.algo.types import EDIT_TYPE
+from pr_agent.config_loader import get_settings, get_verbosity_level
 from pr_agent.log import get_logger
 
 # Optimized: Pre-compile the hunk header regex at the module level to avoid redundant compilation
 # in performance-critical patch processing functions.
 RE_HUNK_HEADER = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)")
+
+
+def to_hunk_only_patch(patch_str: str) -> str:
+    """Drop unified-diff file metadata before the first hunk.
+
+    ``FilePatchInfo.patch`` consumers expect hunk-only patches and may otherwise
+    treat ``---``/``+++`` file headers as changed source lines. Returns an empty
+    string when the diff has no textual hunk, for example a rename-only change.
+    """
+    lines = patch_str.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("@@"):
+            return "".join(lines[i:])
+    return ""
 
 
 def extend_patch(original_file_str, patch_str, patch_extra_lines_before=0,
@@ -284,14 +298,14 @@ def handle_patch_deletions(patch: str, original_file_content_str: str,
     """
     if not new_file_content_str and (edit_type == EDIT_TYPE.DELETED or edit_type == EDIT_TYPE.UNKNOWN):
         # logic for handling deleted files - don't show patch, just show that the file was deleted
-        if get_settings().config.verbosity_level > 0:
+        if get_verbosity_level() > 0:
             get_logger().info(f"Processing file: {file_name}, minimizing deletion file")
         patch = None # file was deleted
     else:
         patch_lines = patch.splitlines()
         patch_new = omit_deletion_hunks(patch_lines)
         if patch != patch_new:
-            if get_settings().config.verbosity_level > 0:
+            if get_verbosity_level() > 0:
                 get_logger().info(f"Processing file: {file_name}, hunks were deleted")
             patch = patch_new
     return patch
@@ -347,13 +361,21 @@ __old hunk__
     start1, size1, start2, size2 = -1, -1, -1, -1
     prev_header_line = []
     header_line = []
+    skip_hunk = False
     for line_i, line in enumerate(patch_lines):
         if 'no newline at end of file' in line.lower():
             continue
 
         if line.startswith('@@'):
+            hunk_header_match = RE_HUNK_HEADER.match(line)
+            if not hunk_header_match:
+                get_logger().warning("Skipping a line that starts with '@@' but is not a unified "
+                                     "hunk header", artifact={"line": line})
+                skip_hunk = True
+                continue
+            skip_hunk = False
             header_line = line
-            match = RE_HUNK_HEADER.match(line)
+            match = hunk_header_match
             if match and (new_content_lines or old_content_lines):  # found a new hunk, split the previous lines
                 if prev_header_line:
                     patch_with_lines_str += f'\n{prev_header_line}\n'
@@ -377,6 +399,11 @@ __old hunk__
 
             section_header, size1, size2, start1, start2 = extract_hunk_headers(match)
 
+        elif skip_hunk:
+            continue
+        elif match is None:
+            # Ignore unified-diff file metadata before the first valid hunk.
+            continue
         elif line.startswith('+'):
             new_content_lines.append(line)
         elif line.startswith('-'):
@@ -412,6 +439,16 @@ __old hunk__
 
 def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, side, remove_trailing_chars: bool = True) -> tuple[str, str]:
     try:
+        try:
+            line_start = int(line_start)
+        except (ValueError, TypeError):
+            get_logger().warning(f"Ignoring invalid line_start {line_start!r} for '{file_name}'")
+            line_start = -1
+        try:
+            line_end = int(line_end)
+        except (ValueError, TypeError):
+            get_logger().warning(f"Ignoring invalid line_end {line_end!r} for '{file_name}'")
+            line_end = -1
         patch_with_lines_str = f"\n\n## File: '{file_name.strip()}'\n\n"
         selected_lines = ""
         patch_lines = patch.splitlines()
@@ -424,11 +461,15 @@ def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, s
                 continue
 
             if line.startswith('@@'):
+                match = RE_HUNK_HEADER.match(line)
+                if not match:
+                    get_logger().warning("Skipping a line that starts with '@@' but is not a "
+                                         "unified hunk header", artifact={"line": line})
+                    skip_hunk = True
+                    continue
                 skip_hunk = False
                 selected_lines_num = 0
                 header_line = line
-
-                match = RE_HUNK_HEADER.match(line)
 
                 section_header, size1, size2, start1, start2 = extract_hunk_headers(match)
 
