@@ -9,7 +9,7 @@ In terms of precedence, local configurations will override global configurations
 
 
 For a list of all possible configurations, see the [configuration options](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) page.
-In addition to general configuration options, each tool has its own configurations. For example, the `review` tool will use parameters from the [pr_reviewer](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml#L76) section in the configuration file.
+In addition to general configuration options, each tool has its own configurations. For example, the `review` tool will use parameters from the [pr_reviewer](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) section in the configuration file.
 
 !!! tip "Tip1: Edit only what you need"
     Your configuration file should be minimal, and edit only the relevant values. Don't copy the entire configuration options, since it can lead to legacy problems when something changes.
@@ -64,13 +64,16 @@ If `.pr_agent.toml` cannot be loaded from the requested branch (e.g. the branch 
 
 ## Global configuration file
 
-`Platforms supported: GitHub, GitLab (cloud), Bitbucket (cloud)`
+`Platforms supported: GitHub, GitLab, Bitbucket (cloud), Bitbucket Server, Azure DevOps, Gitea`
 
 Create a repository named `pr-agent-settings` at the organization level; its `.pr_agent.toml` (read from that repo's default branch) is used as a global configuration for every repository under the same organization:
 
 - **GitHub:** `<organization>/pr-agent-settings`
-- **GitLab (cloud):** `<top-level-group>/pr-agent-settings` (GitLab.com only; not applied on self-hosted GitLab)
+- **GitLab:** `<top-level-group>/pr-agent-settings` (both GitLab.com and self-hosted GitLab)
 - **Bitbucket (cloud):** `<workspace>/pr-agent-settings`
+- **Bitbucket Server:** `<project>/pr-agent-settings`
+- **Azure DevOps:** `<org>/<project>/pr-agent-settings` (looked up in the same project as the current repository)
+- **Gitea:** `<owner>/pr-agent-settings`
 
 Parameters from a local `.pr_agent.toml` file, in a specific repo, will override the global configuration parameters (the global file is merged *beneath* the repo-local one).
 For GitHub Enterprise Server, use the same organization-level repository on your GHES host.
@@ -96,11 +99,11 @@ For example, in the GitHub organization `qodo-ai`:
 
 `Platforms supported: GitLab, Bitbucket Data Center`
 
-Create a repository named `pr-agent-settings` within a specific project (Bitbucket) or a group/subgroup (Gitlab). 
+Create a repository named `pr-agent-settings` within a specific project (Bitbucket) or a group/subgroup (GitLab).
 The configuration file in this repository will apply to all repositories directly under the same project/group/subgroup.
 
 !!! note "Note"
-    For Gitlab, in case of a repository nested in several sub groups, the lookup for a pr-agent-settings repo will be only on one level above such repository.
+    For GitLab, in case of a repository nested in several sub groups, the lookup for a pr-agent-settings repo will be only on one level above such repository.
 
 
 ## Organization level configuration file

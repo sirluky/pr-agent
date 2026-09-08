@@ -5,9 +5,13 @@ import sys
 
 from pr_agent.agent.pr_agent import PRAgent, commands
 from pr_agent.algo.ai_handlers.litellm_helpers import (
-    DEFAULT_CALLBACK_TIMEOUT_SECONDS, drain_litellm_callbacks,
-    litellm_callbacks_registered)
+    DEFAULT_CALLBACK_TIMEOUT_SECONDS,
+    drain_litellm_callbacks,
+    litellm_callbacks_registered,
+)
+from pr_agent.algo.artifacts import inject_artifact_context
 from pr_agent.algo.utils import get_version
+from pr_agent.command_descriptions import COMMAND_DESCRIPTIONS
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger, setup_logger
 
@@ -17,37 +21,30 @@ setup_logger(log_level)
 
 def set_parser():
     parser = argparse.ArgumentParser(description='AI based pull request analyzer', usage=
-    """\
+    f"""\
     Usage: cli.py --pr_url=<URL on supported git hosting service> <command> [<args>].
     For example:
     - cli.py --pr_url=... review
     - cli.py --pr_url=... describe
     - cli.py --pr_url=... improve
     - cli.py --pr_url=... ask "write me a poem about this PR"
-    - cli.py --pr_url=... reflect
     - cli.py --issue_url=... similar_issue
-    - cli.py --pr_url/--issue_url= help_docs [<asked question>]
 
     Supported commands:
-    - review / review_pr - Add a review that includes a summary of the PR and specific suggestions for improvement.
+    - review / review_pr - {COMMAND_DESCRIPTIONS["review"]}
 
     - ask / ask_question [question] - Ask a question about the PR.
 
-    - describe / describe_pr - Modify the PR title and description based on the PR's contents.
+    - describe / describe_pr - {COMMAND_DESCRIPTIONS["describe"]}
 
-    - improve / improve_code - Suggest improvements to the code in the PR as pull request comments ready to commit.
+    - improve / improve_code - {COMMAND_DESCRIPTIONS["improve"]}
     Extended mode ('improve --extended') employs several calls, and provides a more thorough feedback
-
-    - reflect - Ask the PR author questions about the PR.
 
     - update_changelog - Update the changelog based on the PR's contents.
 
     - add_docs
 
     - generate_labels
-
-    - help_docs - Ask a question, from either an issue or PR context, on a given repo (current context or a different one)
-
 
     Configuration:
     To edit any configuration parameter from 'configuration.toml', just add -config_path=<value>.
@@ -75,6 +72,8 @@ def set_parser():
                         help="Read a unified diff from stdin (plain-diff local mode)")
     parser.add_argument("--output", dest="output", type=str, default=None,
                         help="Write the result to this file (in addition to stdout)")
+    parser.add_argument("--json-output", dest="json_output", type=str, default=None,
+                        help="Write the parsed review and token usage to this JSON file")
     parser.add_argument('command', type=str, help='The', choices=commands, default='review')
     parser.add_argument('rest', nargs=argparse.REMAINDER, default=[])
     return parser
@@ -94,6 +93,8 @@ def run(inargs=None, args=None):
     if not args:
         args = parser.parse_args(inargs)
     diff_mode = getattr(args, "stdin", False) or getattr(args, "diff_file", None)
+    if getattr(args, "json_output", None) and not diff_mode:
+        parser.error("--json-output is only supported in plain-diff mode (--stdin or --diff-file)")
     if diff_mode:
         if args.stdin and args.diff_file:
             parser.error("--stdin and --diff-file are mutually exclusive")
@@ -112,6 +113,7 @@ def run(inargs=None, args=None):
         get_settings().set("config.git_provider", "plain-diff")
         get_settings().set("plain_diff.content", diff_content)
         get_settings().set("plain_diff.output_path", getattr(args, "output", None))
+        get_settings().set("plain_diff.json_output_path", getattr(args, "json_output", None))
         # Plain-diff mode's whole purpose is to emit the result to stdout/--output, so
         # force publishing on even if a config/env set publish_output=false.
         get_settings().set("config.publish_output", True)
@@ -133,6 +135,9 @@ def run(inargs=None, args=None):
     # previously-set value from an earlier run() call in the same process can't
     # leak into a later one (get_settings() is a process-wide singleton).
     get_settings().set("CONFIG.EXTRA_CONFIG_URL", getattr(args, "extra_config_url", None))
+    # A CI artifact (see [artifacts]) reaches the prompts from the environment or the settings files,
+    # the same way it does under the GitHub Action, so any pipeline that runs the CLI can supply one.
+    inject_artifact_context()
 
     async def inner():
         if args.issue_url:

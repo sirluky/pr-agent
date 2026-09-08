@@ -6,8 +6,10 @@ mutates only the per-request copy — load-bearing isolation under concurrency),
 the inbound text to a pr-agent command, and completes the Task with the rendered
 markdown.
 
-On success the review text is published as an artifact (RISK 2: the reference agent's
-pollTask reads task.artifacts, not the completion message), then complete().
+For a new request, a working Task is published before the long-running route starts so
+that A2A cancellation can resolve the task from the store. On success the review text
+is published as an artifact (RISK 2: the reference agent's pollTask reads
+task.artifacts, not the completion message), then complete().
 
 On any failure — including ok=False from the router (Fix C) — an artifact containing
 the error text is published first (required to initialise the task before sending a
@@ -21,15 +23,14 @@ import copy
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Part
+from a2a.types import Part, Task, TaskState, TaskStatus
 from starlette_context import context as sctx
 
+from pr_agent.algo import normalize_litellm_model
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.log import get_logger
 from pr_agent.mosaico.dispatch import route_and_run_result
-from pr_agent.mosaico.observability import (langfuse_span,
-                                            mosaico_log_context,
-                                            parse_observability_metadata)
+from pr_agent.mosaico.observability import langfuse_span, mosaico_log_context, parse_observability_metadata
 
 
 class PRAgentExecutor(AgentExecutor):
@@ -46,6 +47,19 @@ class PRAgentExecutor(AgentExecutor):
             if not context.task_id or not context.context_id:
                 raise ValueError("A2A 1.0 RequestContext missing task_id/context_id")
             updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+
+            # A2A cancellation looks up the persisted Task before invoking this
+            # executor's cancel() callback. Establish the task before starting the
+            # long-running route, but do not replace an existing task on follow-up work.
+            if context.current_task is None:
+                await event_queue.enqueue_event(
+                    Task(
+                        id=context.task_id,
+                        context_id=context.context_id,
+                        status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+                        history=[context.message] if context.message else [],
+                    )
+                )
 
             # Request-scoped settings: the tool run mutates ONLY this deepcopy, never the
             # shared global. get_settings() resolves to sctx["settings"] when present.
@@ -82,7 +96,13 @@ class PRAgentExecutor(AgentExecutor):
             await updater.failed(msg)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        raise NotImplementedError("cancel is not supported by the PR-Agent solution agent")
+        if not context.task_id or not context.context_id:
+            raise ValueError("A2A 1.0 RequestContext missing task_id/context_id")
+
+        # ActiveTask cancels the producer before invoking this callback. The initial
+        # Task event from execute() makes the task/context identifiers resolvable here.
+        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        await updater.cancel()
 
 
 async def health_check() -> str:
@@ -95,20 +115,24 @@ async def health_check() -> str:
         # Construct the handler purely for its side effect of applying pr-agent's LLM
         # config (api_base/key/callbacks/etc.) onto the litellm module — do NOT call its
         # retry-wrapped chat_completion.
-        from pr_agent.algo.ai_handlers.litellm_ai_handler import \
-            LiteLLMAIHandler
+        from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
         handler = LiteLLMAIHandler()
 
         model = get_settings().get("CONFIG.MODEL", None)
         if not model:
             return "Unhealthy: no model configured"
 
+        custom_llm_provider = str(
+            getattr(get_settings().litellm, "custom_llm_provider", "") or ""
+        ).strip().lower()
         kwargs = {
-            "model": model,
+            "model": normalize_litellm_model(model, custom_llm_provider),
             "messages": [{"role": "system", "content": "Say ping"}],
             "max_tokens": 10,
             "timeout": 10,
         }
+        if custom_llm_provider:
+            kwargs["custom_llm_provider"] = custom_llm_provider
         if getattr(handler, "api_base", None):
             kwargs["api_base"] = handler.api_base
 
