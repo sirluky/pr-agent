@@ -20,9 +20,9 @@ from unittest.mock import Mock
 
 import pytest
 
+from pr_agent.algo.comment_identity import emphasize_header
 from pr_agent.algo.utils import (
     convert_to_markdown_v2,
-    emphasize_header,
     format_todo_item,
     format_todo_items,
     is_value_no,
@@ -437,6 +437,18 @@ class TestProcessCanBeSplit:
             "🔀", [{"title": "only one", "relevant_files": ["a.py"]}]
         )
         assert "No multiple PR themes" in out
+
+    def test_string_returns_no_themes(self):
+        out = process_can_be_split("🔀", "No")
+        assert "No multiple PR themes" in out
+
+    def test_dict_returns_no_themes(self):
+        out = process_can_be_split("🔀", {"title": "single mapping"})
+        assert "No multiple PR themes" in out
+
+    def test_affirmative_value_does_not_claim_no_themes(self):
+        out = process_can_be_split("🔀", True)
+        assert "No multiple PR themes" not in out
 
     def test_multiple_themes_render_details(self):
         out = process_can_be_split(

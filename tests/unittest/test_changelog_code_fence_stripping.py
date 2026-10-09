@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from pr_agent.config_loader import get_settings
+from pr_agent.git_providers.git_provider import FileContentSnapshot
 from pr_agent.tools.pr_update_changelog import PRUpdateChangelog, strip_wrapping_code_fence
 
 EXISTING = "# Changelog\n\n## 2026-01-01\n- Initial release\n"
@@ -68,9 +69,62 @@ def test_a_wrapping_fence_is_removed(fenced, expected):
     "- A line with ``` inside it",
     "```\nunterminated fence",
     "- one\n\n```python\nx = 1\n```\n\n- two",
+    # Balanced fences of the entry's own: the trailing fence closes them, it is not a wrapper.
+    "- one\n\n```python\nx = 1\n```",
 ])
 def test_text_without_a_wrapping_fence_is_untouched(text):
     assert strip_wrapping_code_fence(text) == text
+
+
+@pytest.mark.parametrize("fenced, expected", [
+    ("```markdown\n- one\n```", "- one"),
+    # The dangling-closing-fence answer the prompt usually produces.
+    ("- one\n- two\n```", "- one\n- two"),
+    # A whole answer wrapping an entry that itself ends in a code block.
+    ("```markdown\n- one\n\n```python\nx = 1\n```\n```", "- one\n\n```python\nx = 1\n```"),
+])
+def test_stripping_twice_is_the_same_as_once(fenced, expected):
+    """The answer is stripped on the reply and again before the changelog is built."""
+    once = strip_wrapping_code_fence(fenced)
+
+    assert once == expected
+    assert strip_wrapping_code_fence(once.strip()) == expected
+
+
+def test_an_entry_ending_in_a_code_block_is_committed_verbatim():
+    """A second strip used to eat the closing fence, unterminating the code block."""
+    entry = "## 2026-09-06\n\n### Added\n- New CLI flag\n\n```python\nflags.add('--x')\n```"
+
+    new_file_content, _answer = _prepared(strip_wrapping_code_fence(f"```markdown\n{entry}\n```"))
+
+    assert new_file_content == f"{entry}\n\n{EXISTING}"
+
+
+# --------------------------------------------------------------------------------------
+# A complete internal code block followed by the wrapper close
+# --------------------------------------------------------------------------------------
+_ENTRY_WITH_CODE_BLOCK = "## 2026-09-06\n\n### Added\n- New CLI flag\n\n```python\nflags.add('--x')\n```"
+
+
+def test_a_wrapper_close_after_a_complete_code_block_is_removed():
+    """No opening wrapper, a closed internal block, then a trailing wrapper close.
+
+    The trailing fence is a wrapper here: the internal block is already balanced. Keeping it
+    left a dangling fence that rendered every older entry as code.
+    """
+    fenced = f"{_ENTRY_WITH_CODE_BLOCK}\n```"
+
+    assert strip_wrapping_code_fence(fenced) == _ENTRY_WITH_CODE_BLOCK
+    assert strip_wrapping_code_fence(strip_wrapping_code_fence(fenced).strip()) == _ENTRY_WITH_CODE_BLOCK
+
+
+def test_a_leftover_wrapper_fence_is_not_committed():
+    """The prepared changelog must not put the existing entries inside a code block."""
+    new_file_content, _answer = _prepared(strip_wrapping_code_fence(f"{_ENTRY_WITH_CODE_BLOCK}\n```"))
+
+    assert new_file_content == f"{_ENTRY_WITH_CODE_BLOCK}\n\n{EXISTING}"
+    # Every fence in the new entry pairs up, so the existing changelog renders as itself.
+    assert new_file_content.split(EXISTING)[0].count("\n```") % 2 == 0
 
 
 def test_the_commit_hint_is_appended_when_not_committing():
@@ -86,23 +140,28 @@ def test_the_commit_hint_is_appended_when_not_committing():
 @pytest.fixture
 def committing_tool(monkeypatch):
     """The real push path, with only the provider and the 5s settle sleep replaced."""
-    monkeypatch.setattr("pr_agent.tools.pr_update_changelog.sleep", lambda seconds: None)
+    async def no_sleep(seconds):
+        assert seconds == 5
+
+    monkeypatch.setattr("pr_agent.tools.pr_update_changelog.asyncio.sleep", no_sleep)
     monkeypatch.setattr(get_settings().config, "git_provider", "local", raising=False)
     provider = MagicMock()
     provider.get_pr_branch.return_value = "feature/retry"
     tool = PRUpdateChangelog.__new__(PRUpdateChangelog)
     tool.git_provider = provider
     tool.changelog_file = EXISTING
+    tool.changelog_snapshot = FileContentSnapshot(EXISTING, True, "fixture-revision")
     tool.commit_changelog = True
     return tool, provider
 
 
-def test_the_committed_file_keeps_the_inline_code_span(committing_tool):
+@pytest.mark.asyncio
+async def test_the_committed_file_keeps_the_inline_code_span(committing_tool):
     tool, provider = committing_tool
     tool.prediction = "## 2026-09-06\n\n### Fixed\n- Handle `None` in `parse()`"
 
     new_file_content, answer = tool._prepare_changelog_update()
-    tool._push_changelog_update(new_file_content, answer)
+    await tool._push_changelog_update(new_file_content, answer)
 
     committed = provider.create_or_update_pr_file.call_args.kwargs["contents"]
     assert committed.startswith("## 2026-09-06\n\n### Fixed\n- Handle `None` in `parse()`")
@@ -110,12 +169,13 @@ def test_the_committed_file_keeps_the_inline_code_span(committing_tool):
     assert committed.endswith(EXISTING)
 
 
-def test_the_committed_file_is_written_to_the_pr_branch(committing_tool):
+@pytest.mark.asyncio
+async def test_the_committed_file_is_written_to_the_pr_branch(committing_tool):
     tool, provider = committing_tool
     tool.prediction = "## 2026-09-06\n- Handle `None`"
 
     new_file_content, answer = tool._prepare_changelog_update()
-    tool._push_changelog_update(new_file_content, answer)
+    await tool._push_changelog_update(new_file_content, answer)
 
     kwargs = provider.create_or_update_pr_file.call_args.kwargs
     assert kwargs["file_path"] == "CHANGELOG.md"
@@ -123,13 +183,14 @@ def test_the_committed_file_is_written_to_the_pr_branch(committing_tool):
     assert kwargs["message"] == "[skip ci] Update CHANGELOG.md"
 
 
-def test_a_fenced_answer_is_committed_without_its_fence(committing_tool):
+@pytest.mark.asyncio
+async def test_a_fenced_answer_is_committed_without_its_fence(committing_tool):
     """The model often wraps the whole entry; the fence must not reach the file."""
     tool, provider = committing_tool
     tool.prediction = "```markdown\n## 2026-09-06\n- Handle `None`\n```"
 
     new_file_content, answer = tool._prepare_changelog_update()
-    tool._push_changelog_update(new_file_content, answer)
+    await tool._push_changelog_update(new_file_content, answer)
 
     committed = provider.create_or_update_pr_file.call_args.kwargs["contents"]
     assert committed.startswith("## 2026-09-06\n- Handle `None`")

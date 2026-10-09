@@ -1,23 +1,46 @@
 import difflib
 import json
+import math
 import re
 from types import SimpleNamespace
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from atlassian.bitbucket import Cloud
 from starlette_context import context
 
-from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.agent.request_policy import policy_metadata, policy_value
 
 from ..algo.file_filter import filter_ignored
 from ..algo.language_handler import is_valid_file
+from ..algo.types import EDIT_TYPE, FilePatchInfo
 from ..algo.utils import find_line_number_of_relevant_line_in_file
 from ..config_loader import get_settings, get_verbosity_level
 from ..log import get_logger
 from .diff_parsing import to_hunk_only_patch
-from .git_provider import MAX_FILES_ALLOWED_FULL, GitProvider, redact_credentials
+from .git_provider import (
+    MAX_FILES_ALLOWED_FULL,
+    FileContentSnapshot,
+    GitProvider,
+    IncompleteBitbucketPullRequestFilesError,
+    cache_languages,
+    redact_credentials,
+)
+from .request_timeout import get_http_request_timeout
+
+
+def _get_identity_request_timeout() -> float:
+    timeout = get_settings().get("bitbucket.identity_request_timeout")
+    if isinstance(timeout, bool):
+        raise ValueError("bitbucket.identity_request_timeout must be a positive finite number")
+    try:
+        timeout = float(timeout)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("bitbucket.identity_request_timeout must be a positive finite number") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("bitbucket.identity_request_timeout must be a positive finite number")
+    return timeout
 
 
 def _gef_filename(diff):
@@ -26,7 +49,39 @@ def _gef_filename(diff):
     return diff.old.path
 
 
+def _split_raw_diff(raw_diff: str) -> list[str]:
+    return [part for part in re.split(r"(?m)(?=^diff --git )", raw_diff) if part.startswith("diff --git ")]
+
+
+def _diffstat_line_count(diff, field: str) -> Optional[int]:
+    """Return Bitbucket's own count for one diffstat ``field``, or None when it is unusable.
+
+    ``None`` is returned per field rather than per file so the caller can fall back to
+    counting the patch for that side alone, instead of reporting an unrelated side as zero.
+    """
+    data = getattr(diff, "data", None) or {}
+    value = data.get(field)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        get_logger().warning(
+            f"Bitbucket diffstat reported a non-numeric {field} for file {_gef_filename(diff)}"
+        )
+        return None
+
+
 class BitbucketProvider(GitProvider):
+    def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
+        pr = self.pr.data
+        return policy_metadata(title=policy_value(pr, "title"),
+                               sender=(policy_value(pr, "author", "nickname")
+                                       or policy_value(pr, "author", "display_name")),
+                               repo_full_name=policy_value(pr, "destination", "repository", "full_name"),
+                               source_branch=policy_value(pr, "source", "branch", "name"),
+                               target_branch=policy_value(pr, "destination", "branch", "name"))
+
     def __init__(
         self, pr_url: Optional[str] = None, incremental: Optional[bool] = False
     ):
@@ -48,7 +103,7 @@ class BitbucketProvider(GitProvider):
             elif self.auth_type == "bearer":
                 try:
                     self.bearer_token = context.get("bitbucket_bearer_token", None)
-                except:
+                except Exception:
                     self.bearer_token = None
 
                 if not self.bearer_token:
@@ -64,6 +119,7 @@ class BitbucketProvider(GitProvider):
         self.headers = s.headers
         self.bitbucket_client = Cloud(session=s)
         self.max_comment_length = 31000
+        self.max_comment_chars = self.max_comment_length
         self.workspace_slug = None
         self.repo_slug = None
         self.repo = None
@@ -71,6 +127,7 @@ class BitbucketProvider(GitProvider):
         self.pr = None
         self.pr_url = pr_url
         self.temp_comments = []
+        self._published_inline_comment_bodies = []
         self.incremental = incremental
         self.diff_files = None
         self.git_files = None
@@ -85,9 +142,10 @@ class BitbucketProvider(GitProvider):
         if global_settings:
             settings_files.append(("global", global_settings))
         try:
+            destination_commit = self.pr.data["destination"]["commit"]["hash"]
             url = (f"https://api.bitbucket.org/2.0/repositories/{self.workspace_slug}/{self.repo_slug}/src/"
-                   f"{self.pr.destination_branch}/.pr_agent.toml")
-            response = requests.request("GET", url, headers=self.headers)
+                   f"{destination_commit}/.pr_agent.toml")
+            response = requests.request("GET", url, headers=self.headers, timeout=get_http_request_timeout())
             if response.status_code == 200:  # found
                 settings_files.append(("local", response.text.encode('utf-8')))
             elif response.status_code != 404:
@@ -100,19 +158,29 @@ class BitbucketProvider(GitProvider):
     def _get_global_settings_cache_key(self, workspace: str) -> str:
         return f"bitbucket:{workspace}"
 
-    def _fetch_global_repo_settings(self, workspace):
+    def _fetch_global_repo_settings(self, workspace, settings_repo):
         # A missing settings repo/file (404) is an expected fallback -> return "" (cached). Other
         # errors raise (via raise_for_status) so the caller does not cache a transient failure.
-        repo_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/pr-agent-settings"
-        repo_resp = requests.request("GET", repo_url, headers=self.headers)
+        repo_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{settings_repo}"
+        repo_resp = requests.request("GET", repo_url, headers=self.headers, timeout=get_http_request_timeout())
         if repo_resp.status_code in (403, 404):  # missing repo or no access -> expected, cacheable
             return ""
         repo_resp.raise_for_status()
         main_branch = (repo_resp.json().get('mainbranch') or {}).get('name')
         if not main_branch:
             return ""
+        ref_resp = requests.request(
+            "GET", f"{repo_url}/refs/branches/{quote(main_branch, safe='')}", headers=self.headers,
+            timeout=get_http_request_timeout())
+        if ref_resp.status_code in (403, 404):  # missing branch or no access -> expected, cacheable
+            return ""
+        ref_resp.raise_for_status()
+        main_branch_hash = ((ref_resp.json().get('target') or {}).get('hash'))
+        if not main_branch_hash:
+            raise ValueError("Bitbucket default branch response did not include a target hash")
         file_resp = requests.request(
-            "GET", f"{repo_url}/src/{main_branch}/.pr_agent.toml", headers=self.headers)
+            "GET", f"{repo_url}/src/{main_branch_hash}/.pr_agent.toml", headers=self.headers,
+            timeout=get_http_request_timeout())
         if file_resp.status_code in (403, 404):  # missing file or no access -> expected, cacheable
             return ""
         file_resp.raise_for_status()
@@ -121,20 +189,26 @@ class BitbucketProvider(GitProvider):
     def get_repo_file_content(self, file_path: str, from_default_branch: bool = False):
         # Read from the PR destination (target) branch, matching the other providers,
         # or from the repository default branch when from_default_branch is requested.
-        branch = self.get_repo_default_branch() if from_default_branch else self.pr.destination_branch
+        branch = self.get_repo_context_ref(from_default_branch)
         return self.get_pr_file_content(file_path, branch, propagate_errors=True)
+
+    def get_repo_context_ref(self, from_default_branch: bool = False) -> Optional[str]:
+        return self.get_repo_default_branch() if from_default_branch else self.pr.destination_branch
 
     def get_git_repo_url(self, pr_url: str=None) -> str: #bitbucket does not support issue url, so ignore param
         try:
             parsed_url = urlparse(self.pr_url)
             return f"{parsed_url.scheme}://{parsed_url.netloc}/{self.workspace_slug}/{self.repo_slug}.git"
-        except Exception as e:
+        except Exception:
             get_logger().exception(f"url is not a valid merge requests url: {self.pr_url}")
             return ""
 
-    # Given a git repo url, return prefix and suffix of the provider in order to view a given file belonging to that repo.
-    # Example: git clone git clone https://bitbucket.org/pragent/pr-agent.git and branch: main -> prefix: "https://bitbucket.org/pragent/pr-agent/src/main", suffix: ""
-    # In case git url is not provided, provider will use PR context (which includes branch) to determine the prefix and suffix.
+    # Given a git repo url, return prefix and suffix of the provider in order to view a given
+    # file belonging to that repo.
+    # Example: git clone https://bitbucket.org/pragent/pr-agent.git and branch: main -> prefix:
+    # "https://bitbucket.org/pragent/pr-agent/src/main", suffix: ""
+    # In case git url is not provided, provider will use PR context (which includes branch) to
+    # determine the prefix and suffix.
     def get_canonical_url_parts(self, repo_git_url:str=None, desired_branch:str=None) -> Tuple[str, str]:
         scheme_and_netloc = None
         if repo_git_url:
@@ -150,81 +224,53 @@ class BitbucketProvider(GitProvider):
             parsed_pr_url = urlparse(self.pr_url)
             scheme_and_netloc = parsed_pr_url.scheme + "://" + parsed_pr_url.netloc
             workspace_name, project_name = (self.workspace_slug, self.repo_slug)
-        prefix = f"{scheme_and_netloc}/{workspace_name}/{project_name}/src/{desired_branch}"
+        prefix = f"{scheme_and_netloc}/{workspace_name}/{project_name}/src/{quote(desired_branch)}"
         suffix = "" #None
         return (prefix, suffix)
 
 
-    def publish_code_suggestions(self, code_suggestions: list) -> bool:
-        """
-        Publishes code suggestions as comments on the PR.
-        """
-        post_parameters_list = []
-        for suggestion in code_suggestions:
-            body = suggestion["body"]
-            original_suggestion = suggestion.get('original_suggestion', None)  # needed for diff code
-            if original_suggestion:
-                try:
-                    existing_code = original_suggestion['existing_code'].rstrip() + "\n"
-                    improved_code = original_suggestion['improved_code'].rstrip() + "\n"
-                    diff = difflib.unified_diff(existing_code.split('\n'),
-                                                improved_code.split('\n'), n=999)
-                    patch_orig = "\n".join(diff)
-                    patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
-                    diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
-                    # replace ```suggestion ... ``` with diff_code, using regex:
-                    body = re.sub(r'```suggestion.*?```', diff_code, body, flags=re.DOTALL)
-                except Exception as e:
-                    get_logger().exception(f"Bitbucket failed to get diff code for publishing, error: {e}")
-                    continue
+    def _prepare_code_suggestion(self, suggestion: dict) -> dict | None:
+        body = suggestion["body"]
+        original_suggestion = suggestion.get('original_suggestion', None)  # needed for diff code
+        if original_suggestion:
+            try:
+                existing_code = original_suggestion['existing_code'].rstrip() + "\n"
+                improved_code = original_suggestion['improved_code'].rstrip() + "\n"
+                diff = difflib.unified_diff(existing_code.split('\n'), improved_code.split('\n'), n=999)
+                patch_orig = "\n".join(diff)
+                patch = "\n".join(patch_orig.splitlines()[5:]).strip('\n')
+                diff_code = f"\n\n```diff\n{patch.rstrip()}\n```"
+                body = re.sub(r'(?<!`)(`{3,})suggestion.*?\1', lambda _: diff_code, body, flags=re.DOTALL)
+            except Exception as e:
+                get_logger().exception(f"Bitbucket failed to get diff code for publishing, error: {e}")
+                return None
+            return {**suggestion, "body": body}
+        return suggestion
 
-            relevant_file = suggestion["relevant_file"]
-            relevant_lines_start = suggestion["relevant_lines_start"]
-            relevant_lines_end = suggestion["relevant_lines_end"]
+    def _build_code_suggestion_payload(self, suggestion: dict) -> dict:
+        body = suggestion["body"]
+        relevant_lines_start = suggestion["relevant_lines_start"]
+        relevant_lines_end = suggestion["relevant_lines_end"]
+        if relevant_lines_end > relevant_lines_start:
+            return {
+                "body": body,
+                "path": suggestion["relevant_file"],
+                "line": relevant_lines_end,
+                "start_line": relevant_lines_start,
+                "start_side": "RIGHT",
+            }
+        return {
+            "body": body,
+            "path": suggestion["relevant_file"],
+            "line": relevant_lines_start,
+            "side": "RIGHT",
+        }
 
-            if not relevant_lines_start or relevant_lines_start == -1:
-                get_logger().exception(
-                    f"Failed to publish code suggestion, relevant_lines_start is {relevant_lines_start}"
-                )
-                continue
-
-            if relevant_lines_end < relevant_lines_start:
-                get_logger().exception(
-                    f"Failed to publish code suggestion, "
-                    f"relevant_lines_end is {relevant_lines_end} and "
-                    f"relevant_lines_start is {relevant_lines_start}"
-                )
-                continue
-
-            if relevant_lines_end > relevant_lines_start:
-                post_parameters = {
-                    "body": body,
-                    "path": relevant_file,
-                    "line": relevant_lines_end,
-                    "start_line": relevant_lines_start,
-                    "start_side": "RIGHT",
-                }
-            else:  # API is different for single line comments
-                post_parameters = {
-                    "body": body,
-                    "path": relevant_file,
-                    "line": relevant_lines_start,
-                    "side": "RIGHT",
-                }
-            post_parameters_list.append(post_parameters)
-
-        try:
-            return self.publish_inline_comments(post_parameters_list)
-        except Exception as e:
-            get_logger().error(f"Bitbucket failed to publish code suggestion, error: {e}")
-            return False
-
-    def publish_file_comments(self, file_comments: list) -> bool:
-        pass
+    def _log_code_suggestion_publish_error(self, error: Exception) -> None:
+        get_logger().error(f"Bitbucket failed to publish code suggestion, error: {error}")
 
     def is_supported(self, capability: str) -> bool:
-        if capability in ['publish_inline_comments', 'get_labels',
-                  'gfm_markdown', 'publish_file_comments']:
+        if capability in ['publish_inline_comments', 'get_labels', 'gfm_markdown']:
             return False
         if capability == "push_code" and get_settings().config.restricted_mode:
             return False
@@ -264,7 +310,7 @@ class BitbucketProvider(GitProvider):
                     'names_filtered': names_filtered
 
                 })
-            except Exception as e:
+            except Exception:
                 pass
 
         # get the pr patches
@@ -284,15 +330,17 @@ class BitbucketProvider(GitProvider):
                     continue
 
             if pr_patches is None:
-                raise ValueError(f"Failed to decode PR patch with encodings {encodings_to_try}")
+                raise ValueError(f"Failed to decode PR patch with encodings {encodings_to_try}") from e
 
-        diff_split = ["diff --git" + x for x in pr_patches.split("diff --git") if x.strip()]
+        diff_split = _split_raw_diff(pr_patches)
         # filter all elements of 'diff_split' that are of indices in 'diffs_original' that are not in 'diffs'
         if len(diff_split) > len(diffs) and len(diffs_original) == len(diff_split):
             diff_split = [diff_split[i] for i in range(len(diff_split)) if diffs_original[i] in diffs]
         if len(diff_split) != len(diffs):
             get_logger().error(f"Error - failed to split the diff into {len(diffs)} parts")
-            return []
+            raise IncompleteBitbucketPullRequestFilesError(
+                "Bitbucket aggregate diff does not match its changed-file inventory"
+            )
         # Bitbucket headers vary by change type and may include mode or rename
         # metadata. Keep only the unified-diff hunks consumed downstream.
         for i, patch in enumerate(diff_split):
@@ -344,11 +392,25 @@ class BitbucketProvider(GitProvider):
                 original_file_content_str = ""
                 new_file_content_str = ""
 
+            # Bitbucket's diffstat carries the authoritative per-file counts, so prefer it over
+            # counting the patch, field by field. The raw diff can carry no textual hunk, or a
+            # truncated one, even when the diffstat reports real additions and removals, and a
+            # partially populated diffstat still carries the side it does report.
+            patch_lines = diff_split[index].splitlines(keepends=True)
+            lines_added = _diffstat_line_count(diff, "lines_added")
+            if lines_added is None:
+                lines_added = len([line for line in patch_lines if line.startswith('+')])
+            lines_removed = _diffstat_line_count(diff, "lines_removed")
+            if lines_removed is None:
+                lines_removed = len([line for line in patch_lines if line.startswith('-')])
+
             file_patch_canonic_structure = FilePatchInfo(
                 original_file_content_str,
                 new_file_content_str,
                 diff_split[index],
                 file_path,
+                num_plus_lines=lines_added,
+                num_minus_lines=lines_removed,
             )
 
             if diff.data['status'] == 'added':
@@ -364,16 +426,32 @@ class BitbucketProvider(GitProvider):
         if invalid_files_names:
             get_logger().info(f"Disregarding files with invalid extensions:\n{invalid_files_names}")
 
+        self.filtered_diff_file_names = invalid_files_names
         self.diff_files = diff_files
         return diff_files
 
     def get_latest_commit_url(self):
         return self.pr.data['source']['commit']['links']['html']['href']
 
+    def get_pr_head_sha(self) -> str:
+        try:
+            head_sha = self.pr.data['source']['commit']['hash']
+            return head_sha if isinstance(head_sha, str) else ""
+        except (KeyError, AttributeError, TypeError) as e:
+            get_logger().warning(f"Failed to get head SHA, error: {e}")
+            return ""
+
     def _get_cloud_comment(self, comment):
         if isinstance(comment, SimpleNamespace):
             return comment._cloud_comment
         return comment
+
+    def get_comment_url(self, comment):
+        comment = self._get_cloud_comment(comment)
+        return comment.data["links"]["html"]["href"]
+
+    def supports_html_comment_markers(self) -> bool:
+        return False
 
     def supports_review_comment_identity(self) -> bool:
         return True
@@ -382,33 +460,16 @@ class BitbucketProvider(GitProvider):
         try:
             comment = self._get_cloud_comment(comment)
             body = self.limit_output_characters(body, self.max_comment_length)
-            comment.update(content={"raw": body})
+            if isinstance(comment, dict):
+                # publish_comment returns the raw API payload rather than a client object, so
+                # dict.update would only rewrite the local copy and never reach Bitbucket.
+                self.pr.put(f"comments/{comment['id']}", data={"content": {"raw": body}})
+            else:
+                comment.update(content={"raw": body})
             return True
         except Exception as e:
             get_logger().exception(f"Failed to update comment, error: {e}")
             return False
-
-    def publish_persistent_comment(
-        self,
-        pr_comment: str,
-        initial_header: str,
-        update_header: bool = True,
-        name='review',
-        final_update_message=True,
-        as_thread: bool = False,
-        identity_marker: str | None = None,
-        legacy_initial_header: str | None = None,
-    ):
-        return self.publish_persistent_comment_full(
-            pr_comment,
-            initial_header,
-            update_header,
-            name,
-            final_update_message,
-            as_thread=as_thread,
-            identity_marker=identity_marker,
-            legacy_initial_header=legacy_initial_header,
-        )
 
     def publish_comment(self, pr_comment: str, is_temporary: bool = False):
         if is_temporary and not get_settings().config.publish_output_progress:
@@ -453,7 +514,6 @@ class BitbucketProvider(GitProvider):
 
     def publish_inline_comment(self, body: str, relevant_file: str, relevant_line_in_file: str | int,
                                original_suggestion=None) -> bool:
-        body = self.limit_output_characters(body, self.max_comment_length)
         # The base contract passes the line's text; publish_inline_comments passes an already resolved line number.
         if not isinstance(relevant_line_in_file, int):
             comment = self.create_inline_comment(body, relevant_file, relevant_line_in_file)
@@ -462,62 +522,60 @@ class BitbucketProvider(GitProvider):
                                    "to publish an inline comment")
                 return False
             relevant_file, relevant_line_in_file = comment["path"], comment["position"]
+        return self._post_inline_comment(body, relevant_file, relevant_line_in_file)
+
+    def _post_inline_comment(self, body: str, relevant_file: str, from_line: int, to_line: int = None) -> bool:
+        # Bitbucket Cloud anchors a span with 'start_to' and 'to'. Anything that is not a real
+        # span is posted as a single-line comment.
+        body = self.limit_output_characters(body, self.max_comment_length)
+        if isinstance(to_line, int) and to_line > from_line:
+            inline = {"start_to": from_line, "to": to_line, "path": relevant_file}
+            location = f"lines {from_line}-{to_line}"
+        else:
+            inline = {"to": from_line, "path": relevant_file}
+            location = f"line {from_line}"
         payload = json.dumps({
             "content": {
                 "raw": body,
             },
-            "inline": {
-                "to": relevant_line_in_file,
-                "path": relevant_file
-            },
+            "inline": inline,
         })
         try:
             response = requests.request(
-                "POST", self.bitbucket_comment_api_url, data=payload, headers=self.headers
+                "POST", self.bitbucket_comment_api_url, data=payload, headers=self.headers,
+                timeout=get_http_request_timeout()
             )
             response.raise_for_status()
         except Exception as e:
             get_logger().error(
-                f"Failed to publish inline comment to '{relevant_file}' at line {relevant_line_in_file}, error: {e}")
+                f"Failed to publish inline comment to '{relevant_file}' at {location}, error: {e}")
             return False
+        recent_bodies = getattr(self, "_published_inline_comment_bodies", None)
+        if recent_bodies is None:
+            recent_bodies = []
+            self._published_inline_comment_bodies = recent_bodies
+        if body not in recent_bodies:
+            recent_bodies.append(body)
         return True
 
     def get_line_link(self, relevant_file: str, relevant_line_start: int, relevant_line_end: int = None) -> str:
+        relevant_file = quote(relevant_file, safe="/")
         if relevant_line_start == -1:
             link = f"{self.pr_url}/#L{relevant_file}"
         else:
             link = f"{self.pr_url}/#L{relevant_file}T{relevant_line_start}"
         return link
 
-    def generate_link_to_relevant_line_number(self, suggestion) -> str:
-        try:
-            relevant_file = suggestion['relevant_file'].strip('`').strip("'").rstrip()
-            relevant_line_str = suggestion['relevant_line'].rstrip()
-            if not relevant_line_str:
-                return ""
-
-            diff_files = self.get_diff_files()
-            position, absolute_position = find_line_number_of_relevant_line_in_file \
-                (diff_files, relevant_file, relevant_line_str)
-
-            if absolute_position != -1 and self.pr_url:
-                link = f"{self.pr_url}/#L{relevant_file}T{absolute_position}"
-                return link
-        except Exception as e:
-            if get_verbosity_level() >= 2:
-                get_logger().info(f"Failed adding line link, error: {e}")
-
-        return ""
-
     def publish_inline_comments(self, comments: list[dict]) -> bool:
         publishable_count = 0
         published_count = 0
         for comment in comments:
+            to_line = None
             if 'position' in comment:
                 from_line = comment['position']
             elif 'start_line' in comment:  # multi-line comment
-                # note that bitbucket does not seem to support range - only a comment on a single line - https://community.developer.atlassian.com/t/api-post-endpoint-for-inline-pull-request-comments/60452
                 from_line = comment['start_line']
+                to_line = comment.get('line')
             elif 'line' in comment:  # single-line comment
                 from_line = comment['line']
             else:
@@ -525,7 +583,7 @@ class BitbucketProvider(GitProvider):
                 continue
 
             publishable_count += 1
-            if self.publish_inline_comment(comment['body'], comment['path'], from_line):
+            if self._post_inline_comment(comment['body'], comment['path'], from_line, to_line):
                 published_count += 1
 
         # A partial failure must not report failure: the caller republishes the whole
@@ -535,9 +593,10 @@ class BitbucketProvider(GitProvider):
     def get_title(self):
         return self.pr.title
 
+    @cache_languages
     def get_languages(self):
-        languages = {self._get_repo().get_data("language"): 0}
-        return languages
+        language = self._get_repo().get_data("language")
+        return {language: 0} if language else {}
 
     def get_pr_branch(self):
         return self.pr.source_branch
@@ -547,13 +606,16 @@ class BitbucketProvider(GitProvider):
     def get_repo_default_branch(self):
         try:
             url_repo = f"https://api.bitbucket.org/2.0/repositories/{self.workspace_slug}/{self.repo_slug}/"
-            response_repo = requests.request("GET", url_repo, headers=self.headers).json()
-            return response_repo['mainbranch']['name']
-        except:
+            response_repo = requests.request(
+                "GET", url_repo, headers=self.headers, timeout=get_http_request_timeout())
+            response_repo.raise_for_status()
+            return response_repo.json()['mainbranch']['name']
+        except (requests.RequestException, KeyError, TypeError) as error:
+            if isinstance(error, requests.RequestException):
+                get_logger().warning(
+                    f"Failed to read the default branch of {self.workspace_slug}/{self.repo_slug} "
+                    f"({type(error).__name__}); using the pull request's destination branch instead")
             return self.pr.destination_branch
-
-    def get_pr_owner_id(self) -> str | None:
-        return self.workspace_slug
 
     def get_owning_namespace(self) -> str | None:
         if not getattr(self, "headers", None):
@@ -565,6 +627,39 @@ class BitbucketProvider(GitProvider):
 
     def get_user_id(self):
         return 0
+
+    def _get_authenticated_account_id(self) -> str:
+        agent_account_id = getattr(self, "_agent_account_id", None)
+        if isinstance(agent_account_id, str) and agent_account_id.strip():
+            return agent_account_id
+
+        response = requests.request(
+            "GET",
+            "https://api.bitbucket.org/2.0/user",
+            headers=self.headers,
+            timeout=_get_identity_request_timeout(),
+        )
+        response.raise_for_status()
+        account_data = response.json()
+        agent_account_id = account_data.get("account_id") if isinstance(account_data, dict) else None
+        if not isinstance(agent_account_id, str) or not agent_account_id.strip():
+            raise RuntimeError("Bitbucket authenticated account cannot be verified")
+        self._agent_account_id = agent_account_id
+        return agent_account_id
+
+    def is_comment_authored_by_pr_agent(self, comment) -> bool:
+        """Verify a Bitbucket Cloud comment belongs to this authenticated account."""
+        cloud_comment = self._get_cloud_comment(comment)
+        comment_data = cloud_comment if isinstance(cloud_comment, dict) else getattr(cloud_comment, "data", None)
+        if not isinstance(comment_data, dict):
+            raise RuntimeError("Bitbucket comment author cannot be verified")
+        author = comment_data.get("user") or comment_data.get("author")
+        comment_account_id = author.get("account_id") if isinstance(author, dict) else None
+        if not isinstance(comment_account_id, str) or not comment_account_id.strip():
+            raise RuntimeError("Bitbucket comment author cannot be verified")
+
+        agent_account_id = self._get_authenticated_account_id()
+        return comment_account_id.casefold() == agent_account_id.casefold()
 
     def get_issue_comments(self):
         comments = []
@@ -582,6 +677,19 @@ class BitbucketProvider(GitProvider):
             )
 
         return comments
+
+    def get_persistent_comment_bodies(self) -> list[str]:
+        """Return existing Bitbucket Cloud comment bodies for inline deduplication."""
+        bodies = list(getattr(self, "_published_inline_comment_bodies", []))
+        for comment in self.get_issue_comments():
+            body = getattr(comment, "body", "")
+            if body and body not in bodies:
+                bodies.append(body)
+        return bodies
+
+    def get_recent_inline_comment_bodies(self) -> list[str]:
+        """Return inline comment bodies published during this provider run."""
+        return list(getattr(self, "_published_inline_comment_bodies", []))
 
     def remove_reaction(self, issue_comment_id: int, reaction_id: int) -> bool:
         return True
@@ -627,13 +735,12 @@ class BitbucketProvider(GitProvider):
                 branch = self.pr.data["destination"]["commit"]["hash"]
             url = (f"https://api.bitbucket.org/2.0/repositories/{self.workspace_slug}/{self.repo_slug}/src/"
                    f"{branch}/{file_path}")
-            response = requests.request("GET", url, headers=self.headers)
+            response = requests.request("GET", url, headers=self.headers, timeout=get_http_request_timeout())
             if response.status_code == 404:  # not found
                 return ""
             # Distinguish an unavailable file from a failed request to prevent an error response
             # body from being treated as repository instructions or changelog content.
-            if propagate_errors:
-                response.raise_for_status()
+            response.raise_for_status()
             contents = response.text
             return contents
         except Exception:
@@ -641,7 +748,26 @@ class BitbucketProvider(GitProvider):
                 raise
             return ""
 
-    def create_or_update_pr_file(self, file_path: str, branch: str, contents="", message="") -> None:
+    def get_pr_file_content_snapshot(self, file_path: str, branch: str) -> FileContentSnapshot:
+        if branch != self.pr.source_branch:
+            raise ValueError("Bitbucket file snapshots require the PR source branch")
+        revision = self.pr.data["source"]["commit"]["hash"]
+        if not isinstance(revision, str) or not revision:
+            raise ValueError("Bitbucket file snapshot is missing its source commit")
+        url = (f"https://api.bitbucket.org/2.0/repositories/{self.workspace_slug}/{self.repo_slug}/src/"
+               f"{revision}/{file_path}")
+        response = requests.request(
+            "GET", url, headers=self.headers, timeout=get_http_request_timeout())
+        if response.status_code == 404:
+            return FileContentSnapshot("", False, revision)
+        response.raise_for_status()
+        return FileContentSnapshot(response.text, True, revision)
+
+    def create_or_update_pr_file(
+        self, file_path: str, branch: str, contents="", message="", *, expected_snapshot: FileContentSnapshot
+    ) -> None:
+        if not isinstance(expected_snapshot.revision, str) or not expected_snapshot.revision:
+            raise ValueError("Bitbucket file write requires the captured source commit")
         url = (f"https://api.bitbucket.org/2.0/repositories/{self.workspace_slug}/{self.repo_slug}/src/")
         if not message:
             if contents:
@@ -651,22 +777,28 @@ class BitbucketProvider(GitProvider):
         files = {file_path: contents}
         data = {
             "message": message,
-            "branch": branch
+            "branch": branch,
+            # Assert the current HEAD of an existing branch; do not rely on this to
+            # guard a deleted branch's lifecycle because this endpoint can recreate it.
+            "parents": expected_snapshot.revision,
         }
         headers = {'Authorization': self.headers['Authorization']} if 'Authorization' in self.headers else {}
-        try:
-            requests.request("POST", url, headers=headers, data=data, files=files)
-        except Exception:
-            get_logger().exception(f"Failed to create empty file {file_path} in branch {branch}")
+        response = requests.request(
+            "POST", url, headers=headers, data=data, files=files, timeout=get_http_request_timeout())
+        response.raise_for_status()
 
     def _get_pr_file_content(self, remote_link: str):
         try:
-            response = requests.request("GET", remote_link, headers=self.headers)
+            response = requests.request("GET", remote_link, headers=self.headers, timeout=get_http_request_timeout())
             if response.status_code == 404:  # not found
                 return ""
+            response.raise_for_status()
             contents = response.text
             return contents
-        except Exception:
+        except Exception as error:
+            if isinstance(error, requests.RequestException):
+                get_logger().warning(
+                    f"Failed to read {remote_link!r} ({type(error).__name__}); treating it as an empty file")
             return ""
 
     def get_commit_messages(self) -> str:
@@ -679,7 +811,9 @@ class BitbucketProvider(GitProvider):
             payload_dict["title"] = pr_title
         payload = json.dumps(payload_dict)
 
-        response = requests.request("PUT", self.bitbucket_pull_request_api_url, headers=self.headers, data=payload)
+        response = requests.request(
+            "PUT", self.bitbucket_pull_request_api_url, headers=self.headers, data=payload,
+            timeout=get_http_request_timeout())
         if not 200 <= response.status_code < 300:
             message = f"Failed to update description, error code: {response.status_code}"
             get_logger().error(message)
@@ -712,7 +846,10 @@ class BitbucketProvider(GitProvider):
             clone_url = f"{scheme}x-token-auth:{self.bearer_token}@bitbucket.org{base_url}"
         else:
             # This case should ideally not be reached if __init__ validates auth_type
-            get_logger().error(f"Unsupported or uninitialized auth_type: {getattr(self, 'auth_type', 'N/A')}. Returning None")
+            get_logger().error(
+                f"Unsupported or uninitialized auth_type: "
+                f"{getattr(self, 'auth_type', 'N/A')}. Returning None"
+            )
             return None
 
         return clone_url

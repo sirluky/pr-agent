@@ -15,6 +15,7 @@ DEFAULT_CALLBACK_TIMEOUT_SECONDS = 30
 MAX_DRAIN_ROUNDS = 5
 FLUSH_RESERVE_SECONDS = 1.0  # cap for each terminal phase reservation
 CANCELLATION_CLEANUP_SECONDS = 0.1
+_stream_close_tasks = set()
 _LITELLM_CALLBACK_ATTRS = (
     "callbacks",
     "success_callback",
@@ -62,7 +63,61 @@ def _stream_usage(chunk):
     return None
 
 
-async def _handle_streaming_response(response, model=None):
+class EmptyTruncatedResponseError(openai.APIError):
+    """The model returned no content because it exhausted the output budget.
+
+    Raised when an empty response carries ``finish_reason == "length"``, for both streaming and
+    non-streaming calls. Replaying the identical request on the same model reproduces the
+    truncation, so by default the handler hands this straight to the fallback-models loop
+    instead of paying for a second identical, empty call. Set config.retry_same_model_on_length
+    to retry anyway.
+    """
+
+
+def _warn_stream_cleanup(message):
+    try:
+        get_logger().warning(message)
+    except Exception:
+        # Logging must not replace the inference result during cleanup.
+        pass
+
+
+async def _aclose_quietly(response):
+    """Close a stream without replacing its result or exposing provider details."""
+    try:
+        result = getattr(response, "aclose", lambda: None)()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as error:
+        _warn_stream_cleanup(f"Failed to close streaming response: {type(error).__name__}")
+
+
+async def _close_stream(response):
+    """Let consumer cancellation propagate without interrupting stream cleanup."""
+    try:
+        task = asyncio.ensure_future(_aclose_quietly(response))
+        # Keep a strong reference when a cancelled consumer leaves cleanup running.
+        _stream_close_tasks.add(task)
+        task.add_done_callback(_stream_close_tasks.discard)
+        # Skip waiting while cancellation unwinds, even without a task.cancel() request.
+        if not asyncio.current_task().cancelling() and not isinstance(sys.exception(), asyncio.CancelledError):
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+                _warn_stream_cleanup("Failed to close streaming response: CancelledError")
+    finally:
+        # LiteLLM's close task cannot restore the consuming task's correlation IDs.
+        restore = getattr(type(response), "_restore_consumer_correlation_context", None)
+        if callable(restore):
+            try:
+                restore(response)
+            except Exception:
+                _warn_stream_cleanup("Unable to restore stream correlation context")
+
+
+async def _handle_streaming_response(response, model=None, stream_cleanup=None):
     """
     Handle streaming response from acompletion and collect the full response.
 
@@ -92,14 +147,22 @@ async def _handle_streaming_response(response, model=None):
     except Exception as e:
         get_logger().error(f"Error handling streaming response: {e}")
         raise
+    finally:
+        if stream_cleanup is None:
+            await _close_stream(response)
+        else:
+            stream_cleanup.append(response)
 
     if not full_response and finish_reason is None:
         get_logger().warning("Streaming response resulted in empty content with no finish reason")
         raise openai.APIError("Empty streaming response received without proper completion",
                               request=httpx.Request("POST", model or ""), body=None)
     elif not full_response and finish_reason:
-        get_logger().debug(f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}")
-        raise openai.APIError(
+        get_logger().debug(
+            f"Streaming response resulted in empty content but completed with finish_reason: {finish_reason}"
+        )
+        error_cls = EmptyTruncatedResponseError if finish_reason == "length" else openai.APIError
+        raise error_cls(
             f"Streaming response completed with finish_reason '{finish_reason}' but no content received",
             request=httpx.Request("POST", model or ""), body=None)
     return full_response, finish_reason, MockResponse(full_response, finish_reason, finalized_usage, model)
@@ -152,24 +215,31 @@ def get_repetition_penalty():
     return penalty
 
 
-def _get_azure_ad_token():
+def _get_azure_ad_credential(settings):
+    """Create an Azure AD credential for one handler/request context."""
+    from azure.identity import ClientSecretCredential
+
+    return ClientSecretCredential(
+        tenant_id=settings.azure_ad.tenant_id,
+        client_id=settings.azure_ad.client_id,
+        client_secret=settings.azure_ad.client_secret,
+    )
+
+
+def _get_azure_ad_token(credential):
     """
     Generates an access token using Azure AD credentials from settings.
     Returns:
         str: The access token
     """
-    from azure.identity import ClientSecretCredential
+    if credential is None:
+        raise ValueError("Azure AD credential is required for request-local token resolution")
     try:
-        credential = ClientSecretCredential(
-            tenant_id=get_settings().azure_ad.tenant_id,
-            client_id=get_settings().azure_ad.client_id,
-            client_secret=get_settings().azure_ad.client_secret
-        )
         # Get token for Azure OpenAI service
         token = credential.get_token("https://cognitiveservices.azure.com/.default")
         return token.token
     except Exception as e:
-        get_logger().error(f"Failed to get Azure AD token: {e}")
+        get_logger().error(f"Failed to get Azure AD token: {type(e).__name__}")
         raise
 
 
@@ -186,7 +256,7 @@ def _process_litellm_extra_body(kwargs: dict) -> dict:
     Raises:
         ValueError: If extra_body contains invalid JSON, unsupported keys, or colliding keys
     """
-    allowed_extra_body_keys = {"processing_mode", "service_tier"}
+    allowed_extra_body_keys = {"processing_mode", "service_tier", "chat_template_kwargs"}
     extra_body = getattr(getattr(get_settings(), "litellm", None), "extra_body", None)
     if extra_body:
         try:
@@ -195,13 +265,16 @@ def _process_litellm_extra_body(kwargs: dict) -> dict:
                 raise ValueError("LITELLM.EXTRA_BODY must be a JSON object")
             unsupported_keys = set(litellm_extra_body.keys()) - allowed_extra_body_keys
             if unsupported_keys:
-                raise ValueError(f"LITELLM.EXTRA_BODY contains unsupported keys: {', '.join(unsupported_keys)}. Allowed keys: {', '.join(allowed_extra_body_keys)}")
+                raise ValueError(
+                f"LITELLM.EXTRA_BODY contains unsupported keys: {', '.join(unsupported_keys)}. "
+                f"Allowed keys: {', '.join(allowed_extra_body_keys)}"
+            )
             colliding_keys = kwargs.keys() & litellm_extra_body.keys()
             if colliding_keys:
                 raise ValueError(f"LITELLM.EXTRA_BODY cannot override existing parameters: {', '.join(colliding_keys)}")
             kwargs.update(litellm_extra_body)
         except json.JSONDecodeError as e:
-            raise ValueError(f"LITELLM.EXTRA_BODY contains invalid JSON: {str(e)}")
+            raise ValueError(f"LITELLM.EXTRA_BODY contains invalid JSON: {str(e)}") from e
     return kwargs
 
 
