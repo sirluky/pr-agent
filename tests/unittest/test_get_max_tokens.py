@@ -716,6 +716,15 @@ class TestGetMaxTokens:
             "bedrock/eu.anthropic.claude-opus-5-5",
             "bedrock/au.anthropic.claude-opus-5-5",
             "bedrock/jp.anthropic.claude-opus-5-5",
+            "anthropic/claude-haiku-5-5",
+            "claude-haiku-5-5",
+            "vertex_ai/claude-haiku-5-5",
+            "bedrock/anthropic.claude-haiku-5-5",
+            "bedrock/global.anthropic.claude-haiku-5-5",
+            "bedrock/us.anthropic.claude-haiku-5-5",
+            "bedrock/eu.anthropic.claude-haiku-5-5",
+            "bedrock/au.anthropic.claude-haiku-5-5",
+            "bedrock/jp.anthropic.claude-haiku-5-5",
         ],
     )
     def test_claude_opus_5_family_model_max_tokens(self, monkeypatch, model):

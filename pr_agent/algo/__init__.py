@@ -33,6 +33,11 @@ _CLAUDE_MODEL_FAMILIES = [
         "bedrock_regions": _DEFAULT_BEDROCK_REGIONS,
     },
     {
+        "model_id": "claude-haiku-5-5",
+        "max_tokens": 1000000,
+        "bedrock_regions": _DEFAULT_BEDROCK_REGIONS,
+    },
+    {
         "model_id": "claude-sonnet-5",
         "max_tokens": 1000000,
         "bedrock_regions": _DEFAULT_BEDROCK_REGIONS,
