@@ -49,6 +49,9 @@ def _make_pr_questions(question_str: str = "", prediction: str = "", git_provide
 def _make_line_questions() -> plq.PR_LineQuestions:
     obj = plq.PR_LineQuestions.__new__(plq.PR_LineQuestions)
     obj.vars = {}
+    obj.ai_handler = None
+    obj._ai_handler_factory = MagicMock(return_value=MagicMock())
+    obj.main_pr_language = ""
     obj.resolve_threads = False
     obj.git_provider = MagicMock()
     obj.git_provider.supports_threaded_pr_questions.return_value = False
@@ -196,20 +199,29 @@ class TestIdentifyImageInComment:
             question_str="explain this ![image](https://example.com/foo.png)"
         )
         result = pr.identify_image_in_comment()
-        # Current contract: parses out content between the parentheses after
-        # the literal "![image]" marker (strips surrounding parens).
         assert result == "https://example.com/foo.png"
         assert pr.vars["img_path"] == "https://example.com/foo.png"
+
+    def test_markdown_image_excludes_trailing_question_text(self):
+        pr = _make_pr_questions(
+            question_str='What changed? ![image](https://example.com/foo.png "preview") Please explain.'
+        )
+        assert pr.identify_image_in_comment() == "https://example.com/foo.png"
+        assert pr.vars["img_path"] == "https://example.com/foo.png"
+
+    def test_markdown_image_with_other_alt_text_and_extensionless_url(self):
+        pr = _make_pr_questions(
+            question_str="Review ![Screenshot](https://github.com/user-attachments/assets/1234) please"
+        )
+        assert pr.identify_image_in_comment() == "https://github.com/user-attachments/assets/1234"
+        assert pr.vars["img_path"] == "https://github.com/user-attachments/assets/1234"
 
     def test_direct_image_url_png(self):
         pr = _make_pr_questions(
             question_str="please look at https://example.com/diagram.png and answer"
         )
         result = pr.identify_image_in_comment()
-        # Current behavior captures everything from "https://" to end of string
-        # (including any trailing text). We assert the prefix / contains the URL,
-        # rather than the exact full match, to remain robust to that quirk.
-        assert result.startswith("https://example.com/diagram.png")
+        assert result == "https://example.com/diagram.png"
         assert pr.vars["img_path"] == result
 
     def test_direct_image_url_jpg(self):
@@ -847,7 +859,10 @@ class TestExtraInstructionsPromptRendering:
             "pr_questions.extra_instructions",
             "Do not answer questions that ask to rate PR quality.",
         )
-        variables = {"extra_instructions": get_settings().pr_questions.extra_instructions}
+        variables = {
+            "extra_instructions": get_settings().pr_questions.extra_instructions,
+            "skills_context": "",
+        }
         system_prompt = _render_jinja_template(get_settings().pr_line_questions_prompt.system, variables)
         assert "Do not answer questions that ask to rate PR quality." in system_prompt
         assert "take precedence over any conflicting guidance" in system_prompt
@@ -1130,6 +1145,9 @@ class TestPRLineQuestionsRunSkipsEmptySelection:
     def _provider(self):
         obj = plq.PR_LineQuestions.__new__(plq.PR_LineQuestions)
         obj.vars = {}
+        obj.ai_handler = None
+        obj._ai_handler_factory = MagicMock(return_value=MagicMock())
+        obj.main_pr_language = ""
         obj.git_provider = MagicMock()
         obj.token_handler = MagicMock()
         obj.git_provider.get_diff_files.return_value = [SimpleNamespace(
@@ -1271,7 +1289,7 @@ class TestPRLineQuestionsRunSkipsEmptySelection:
 def line_output_settings():
     keys = (
         "config.publish_output", "pr_questions.use_conversation_history", "ask_diff_hunk",
-        "line_start", "line_end", "side", "file_name", "comment_id",
+        "line_start", "line_end", "side", "file_name", "file_name_encoded", "comment_id",
     )
     saved = snapshot_settings(keys)
     settings = get_settings()
@@ -1306,6 +1324,7 @@ async def test_line_question_dry_run_logs_result_without_provider_effects(
     await tool.run()
 
     assert prediction.await_count == int(matched)
+    assert tool._ai_handler_factory.call_count == int(matched)
     tool.git_provider.reply_to_comment_from_comment_id.assert_not_called()
     tool.git_provider.publish_comment.assert_not_called()
     tool.git_provider.resolve_comment_thread.assert_not_called()
@@ -1449,3 +1468,161 @@ def test_ask_user_prompt_includes_untrusted_conversation_history():
 
     assert "Keep this nullable" in prompt
     assert "untrusted data" in prompt
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("file_name", "encoded", "ask_diff", "expected_language", "bad_map"),
+    [
+        ("src/example.py", False, True, "python", False),
+        ("src%2Fexample.PY", True, True, "python", False),
+        ("README.unknownsuffix", False, True, "", False),
+        ("src/example.py", False, False, "python", False),
+        ("src/example.py", False, True, "", True),
+    ],
+)
+async def test_line_question_only_reads_diff_when_hunk_is_missing(
+    monkeypatch, line_output_settings, file_name, encoded, ask_diff, expected_language, bad_map
+):
+    """A line question must not load the whole PR merely for language logging."""
+    line_output_settings.set("file_name", file_name)
+    line_output_settings.set("file_name_encoded", encoded)
+    line_output_settings.set("config.publish_output", False)
+    if not ask_diff:
+        line_output_settings.set("ask_diff_hunk", "")
+
+    provider = MagicMock()
+    provider.pr.title = "Example"
+    provider.get_pr_branch.return_value = "main"
+    provider.supports_thread_resolution.return_value = False
+    provider.supports_line_question_history.return_value = False
+    provider.get_languages.side_effect = AssertionError("language API not needed")
+    provider.get_files.side_effect = AssertionError("PR file inventory not needed")
+    provider.get_diff_files.return_value = [
+        SimpleNamespace(filename="src/example.py", patch="@@ -1 +1 @@\n-old\n+new")
+    ]
+
+    if bad_map:
+        # An invalid extension-map entry raises during matcher construction.
+        monkeypatch.setattr(plq, "build_language_file_matcher",
+                            MagicMock(side_effect=TypeError("invalid extension map")))
+
+    monkeypatch.setattr(plq, "get_git_provider", lambda: lambda _url: provider)
+    monkeypatch.setattr(plq, "TokenHandler", lambda *_args, **_kwargs: MagicMock())
+    extract_hunk = MagicMock(return_value=("@@ -1 +1 @@\n-old\n+new", "new"))
+    monkeypatch.setattr(plq, "extract_hunk_lines_from_patch", extract_hunk)
+    prediction = AsyncMock(return_value="answer")
+    monkeypatch.setattr(plq, "retry_with_fallback_models", prediction)
+
+    handler = MagicMock()
+    factory = MagicMock(return_value=handler)
+    tool = plq.PR_LineQuestions("https://github.com/org/repo/pull/1", ["why?"], ai_handler=factory)
+    assert tool.main_pr_language == expected_language
+    factory.assert_not_called()
+    await tool.run()
+    factory.assert_called_once_with()
+    assert handler.main_pr_language == expected_language
+
+    provider.get_languages.assert_not_called()
+    provider.get_files.assert_not_called()
+    if ask_diff:
+        provider.get_diff_files.assert_not_called()
+    else:
+        provider.get_diff_files.assert_called_once_with()
+    prediction.assert_awaited_once()
+
+
+def _construct_line_question(monkeypatch, factory):
+    provider = MagicMock()
+    provider.pr.title = "Example"
+    provider.get_pr_branch.return_value = "main"
+    provider.supports_thread_resolution.return_value = False
+    provider.supports_line_question_history.return_value = False
+    monkeypatch.setattr(plq, "get_git_provider", lambda: lambda _url: provider)
+    monkeypatch.setattr(plq, "TokenHandler", lambda *_args, **_kwargs: MagicMock())
+    return plq.PR_LineQuestions("https://github.com/org/repo/pull/1", ["why?"], ai_handler=factory)
+
+
+@pytest.mark.asyncio
+async def test_line_question_no_hunk_does_not_initialize_handler(monkeypatch, line_output_settings):
+    line_output_settings.set("config.publish_output", True)
+    line_output_settings.set("comment_id", "")
+    factory = MagicMock(side_effect=RuntimeError("unused handler setup"))
+    monkeypatch.setattr(plq, "extract_hunk_lines_from_patch", lambda *_args, **_kwargs: ("", ""))
+    retry = AsyncMock()
+    monkeypatch.setattr(plq, "retry_with_fallback_models", retry)
+
+    tool = _construct_line_question(monkeypatch, factory)
+    await tool.run()
+    await tool.run()
+
+    factory.assert_not_called()
+    retry.assert_not_awaited()
+    assert tool.ai_handler is None
+    assert tool.git_provider.publish_comment.call_count == 2
+    assert all("Could not find the requested lines" in call.args[0]
+               for call in tool.git_provider.publish_comment.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_line_question_initializes_once_after_no_hunk(monkeypatch, line_output_settings):
+    line_output_settings.set("config.publish_output", False)
+    handler = MagicMock()
+    factory = MagicMock(return_value=handler)
+    hunk = MagicMock(side_effect=[("", ""), ("@@ -1 +1 @@\n-old\n+new", "new"),
+                                 ("@@ -1 +1 @@\n-old\n+new", "new")])
+    monkeypatch.setattr(plq, "extract_hunk_lines_from_patch", hunk)
+    tool = _construct_line_question(monkeypatch, factory)
+
+    async def predict(*_args, **_kwargs):
+        assert tool.ai_handler is handler
+        assert handler.main_pr_language == tool.main_pr_language
+        return "answer"
+
+    retry = AsyncMock(side_effect=predict)
+    monkeypatch.setattr(plq, "retry_with_fallback_models", retry)
+    factory.assert_not_called()
+    await tool.run()
+    factory.assert_not_called()
+    await tool.run()
+    await tool.run()
+
+    factory.assert_called_once_with()
+    assert retry.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_line_question_handler_assignment_failure_is_retryable(monkeypatch, line_output_settings):
+    line_output_settings.set("config.publish_output", False)
+    error = RuntimeError("language assignment failed")
+
+    class BadHandler:
+        @property
+        def main_pr_language(self):
+            return ""
+
+        @main_pr_language.setter
+        def main_pr_language(self, _value):
+            raise error
+
+    good_handler = MagicMock()
+    factory = MagicMock(side_effect=[BadHandler(), good_handler])
+    monkeypatch.setattr(plq, "extract_hunk_lines_from_patch",
+                        lambda *_args, **_kwargs: ("@@ -1 +1 @@\n-old\n+new", "new"))
+    retry = AsyncMock(return_value="answer")
+    monkeypatch.setattr(plq, "retry_with_fallback_models", retry)
+    tool = _construct_line_question(monkeypatch, factory)
+
+    with pytest.raises(RuntimeError) as caught:
+        await tool.run()
+    assert caught.value is error
+    assert tool.ai_handler is None
+    retry.assert_not_awaited()
+    tool.git_provider.publish_comment.assert_not_called()
+    tool.git_provider.reply_to_comment_from_comment_id.assert_not_called()
+
+    await tool.run()
+
+    assert tool.ai_handler is good_handler
+    assert good_handler.main_pr_language == tool.main_pr_language
+    assert factory.call_count == 2
+    retry.assert_awaited_once()

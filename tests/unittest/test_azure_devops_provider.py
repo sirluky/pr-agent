@@ -1,4 +1,5 @@
 import json
+from datetime import UTC
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -74,6 +75,203 @@ def test_azure_resolve_comment_thread_closes_thread():
 
     assert provider.resolve_comment_thread(42) is True
     provider.set_thread_status.assert_called_once_with(42, "closed")
+
+
+def _linked_work_item_provider(relations, raw_items=()):
+    provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
+    provider.workspace_slug = "my-project"
+    provider.repo_slug = "my-repo"
+    provider.pr_num = 17
+    provider.azure_devops_client = MagicMock()
+    provider.azure_devops_client.get_pull_request_work_item_refs.return_value = relations
+    provider.azure_devops_board_client = MagicMock()
+    provider.azure_devops_board_client.get_work_items.return_value = raw_items
+    return provider
+
+
+def _work_item(item_id, **fields):
+    return SimpleNamespace(
+        id=item_id,
+        url=f"https://dev.azure.com/org/project/_workitems/edit/{item_id}",
+        fields=fields,
+    )
+
+
+def test_get_linked_work_items_confirmed_empty_skips_board_request():
+    provider = _linked_work_item_provider([])
+
+    assert provider.get_linked_work_items() == []
+    provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+def test_get_linked_work_items_materializes_empty_relation_generator():
+    provider = _linked_work_item_provider(item for item in ())
+
+    assert provider.get_linked_work_items() == []
+    provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+@pytest.mark.parametrize("relations", [None, 7])
+def test_get_linked_work_items_rejects_unmaterializable_relations(relations):
+    provider = _linked_work_item_provider(relations)
+
+    with pytest.raises(TypeError):
+        provider.get_linked_work_items()
+    provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+def test_get_linked_work_items_propagates_relation_request_failure():
+    provider = _linked_work_item_provider([])
+    provider.azure_devops_client.get_pull_request_work_item_refs.side_effect = RuntimeError("relation failed")
+
+    with pytest.raises(RuntimeError, match="relation failed"):
+        provider.get_linked_work_items()
+    provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+def test_get_linked_work_items_materializes_relations_before_board_request():
+    def incomplete_relations():
+        yield SimpleNamespace(id="1")
+        raise RuntimeError("relation stream failed")
+
+    provider = _linked_work_item_provider(incomplete_relations())
+
+    with pytest.raises(RuntimeError, match="relation stream failed"):
+        provider.get_linked_work_items()
+    provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+def test_get_linked_work_items_canonicalizes_ids_and_preserves_response_mapping_order():
+    relations = [SimpleNamespace(id="001"), SimpleNamespace(id="2"), SimpleNamespace(id="1")]
+    raw_items = [
+        _work_item(
+            2,
+            **{
+                "System.Title": "Second",
+                "System.Description": "Body 2",
+                "Microsoft.VSTS.Common.AcceptanceCriteria": "AC 2",
+                "System.Tags": "bug; priority",
+            },
+        ),
+        _work_item(1, **{"System.Title": "First"}),
+    ]
+    provider = _linked_work_item_provider(relations, raw_items)
+
+    assert provider.get_linked_work_items() == [
+        {
+            "id": 2,
+            "title": "Second",
+            "url": "https://dev.azure.com/org/project/_workitems/edit/2",
+            "body": "Body 2",
+            "acceptance_criteria": "AC 2",
+            "tags": ["bug", "priority"],
+        },
+        {
+            "id": 1,
+            "title": "First",
+            "url": "https://dev.azure.com/org/project/_workitems/edit/1",
+            "body": "",
+            "acceptance_criteria": "",
+            "tags": [],
+        },
+    ]
+    provider.azure_devops_board_client.get_work_items.assert_called_once_with(
+        project="my-project", ids=[1, 2], error_policy="Fail"
+    )
+
+
+@pytest.mark.parametrize(
+    "relation",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(id=1),
+        SimpleNamespace(id=""),
+        SimpleNamespace(id="  "),
+        SimpleNamespace(id="x"),
+        SimpleNamespace(id="\x1c1\x1c"),
+    ],
+)
+def test_get_linked_work_items_rejects_invalid_relation_id_before_board_request(relation):
+    provider = _linked_work_item_provider([relation])
+
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        provider.get_linked_work_items()
+    provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+@pytest.mark.parametrize(("count", "should_request"), [(200, True), (201, False)])
+def test_get_linked_work_items_enforces_single_batch_limit(count, should_request):
+    relations = [SimpleNamespace(id=str(item_id)) for item_id in range(1, count + 1)]
+    raw_items = [_work_item(item_id) for item_id in range(1, count + 1)]
+    provider = _linked_work_item_provider(relations, raw_items)
+
+    if should_request:
+        result = provider.get_linked_work_items()
+        assert [item["id"] for item in result] == list(range(1, 201))
+        assert provider.azure_devops_board_client.get_work_items.call_count == 1
+    else:
+        with pytest.raises(ValueError, match="200"):
+            provider.get_linked_work_items()
+        provider.azure_devops_board_client.get_work_items.assert_not_called()
+
+
+def test_get_linked_work_items_deduplicates_before_enforcing_batch_limit():
+    relations = [SimpleNamespace(id=str(item_id)) for item_id in range(1, 201)]
+    relations.append(SimpleNamespace(id="001"))
+    raw_items = [_work_item(item_id) for item_id in range(1, 201)]
+    provider = _linked_work_item_provider(relations, raw_items)
+
+    assert len(provider.get_linked_work_items()) == 200
+    provider.azure_devops_board_client.get_work_items.assert_called_once_with(
+        project="my-project", ids=list(range(1, 201)), error_policy="Fail"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_items",
+    [
+        None,
+        7,
+        [],
+        [SimpleNamespace(fields={}, url="url")],
+        [_work_item(2)],
+        [_work_item(1), _work_item(1)],
+        [_work_item(True)],
+        [_work_item("1")],
+        [_work_item(None)],
+    ],
+)
+def test_get_work_items_rejects_incomplete_or_invalid_response_identities(raw_items):
+    provider = _linked_work_item_provider([SimpleNamespace(id="1")], raw_items)
+
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        provider.get_linked_work_items()
+
+
+def test_get_work_items_materializes_bulk_response_before_mapping():
+    def incomplete_items():
+        yield _work_item(1)
+        raise RuntimeError("bulk stream failed")
+
+    provider = _linked_work_item_provider([SimpleNamespace(id="1")], incomplete_items())
+
+    with pytest.raises(RuntimeError, match="bulk stream failed"):
+        provider.get_linked_work_items()
+
+
+def test_get_work_items_propagates_request_and_field_mapping_failures():
+    provider = _linked_work_item_provider([SimpleNamespace(id="1")])
+    provider.azure_devops_board_client.get_work_items.side_effect = RuntimeError("bulk request failed")
+
+    with pytest.raises(RuntimeError, match="bulk request failed"):
+        provider.get_linked_work_items()
+
+    provider.azure_devops_board_client.get_work_items.side_effect = None
+    provider.azure_devops_board_client.get_work_items.return_value = [
+        SimpleNamespace(id=1, url="url", fields=None)
+    ]
+    with pytest.raises(AttributeError):
+        provider.get_linked_work_items()
 
 
 def _language_provider(items):
@@ -364,6 +562,17 @@ class TestAzureDevopsProviderFiles:
 
         assert provider._get_pr_iteration_changes() == entries
         assert provider.azure_devops_client.get_pull_request_iteration_changes.call_count == 4
+
+    def test_diff_files_propagates_iteration_collection_failure(self):
+        provider = self._provider([
+            SimpleNamespace(change_entries=[self._change("/src/first.py")], next_skip=1, next_top=1),
+            RuntimeError("later page failed"),
+        ])
+
+        with pytest.raises(RuntimeError, match="later page failed"):
+            provider.get_diff_files()
+
+        assert provider.diff_files is None
 
     def test_get_files_uses_current_iteration_and_skips_non_file_entries(self):
         provider = self._provider([
@@ -2266,10 +2475,10 @@ def test_azure_lifecycle_matches_descriptor_identity(mock_get_settings):
 
 
 def test_azure_newest_comment_order_is_chronological_across_threads():
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     def timestamp(second):
-        return datetime(2026, 1, 1, 0, 0, second, tzinfo=timezone.utc)
+        return datetime(2026, 1, 1, 0, 0, second, tzinfo=UTC)
 
     def comment(comment_id, body, second):
         return Comment(

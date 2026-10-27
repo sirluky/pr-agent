@@ -1,9 +1,10 @@
 import os
 import re
 import secrets
+from collections.abc import Mapping
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import TypedDict
 from urllib.parse import urlsplit
 
 from pr_agent.config_loader import get_settings
@@ -15,7 +16,7 @@ DEFAULT_ARTIFACT_INSTRUCTIONS = (
     "It was produced by a prior CI step."
 )
 
-SUPPORTED_ARTIFACT_TOOLS = frozenset({"pr_reviewer", "pr_description", "pr_code_suggestions"})
+SUPPORTED_ARTIFACT_TOOLS = frozenset({"pr_reviewer", "pr_description", "pr_code_suggestions", "pr_questions"})
 
 
 class ArtifactPromptContext(TypedDict):
@@ -24,23 +25,31 @@ class ArtifactPromptContext(TypedDict):
     instructions: str
     start_marker: str
     end_marker: str
+    target_tools: frozenset[str]
 
 
-_artifact_context: ContextVar[Optional[tuple[ArtifactPromptContext, frozenset[str]]]] = ContextVar(
+_artifact_context: ContextVar[dict[str, list[ArtifactPromptContext]] | None] = ContextVar(
     "pr_agent_artifact_context", default=None
 )
 
 
-def get_artifact_context(tool_name: str) -> Optional[ArtifactPromptContext]:
+def get_artifact_context(tool_name: str) -> ArtifactPromptContext | None:
     """Return the separate CI artifact prompt context for a targeted tool."""
     payload = _artifact_context.get()
     if payload is None:
         return None
-    context, targets = payload
-    return context if tool_name.lower() in targets else None
+    contexts = payload.get(tool_name.lower(), [])
+    if not contexts:
+        return None
+    if len(contexts) == 1:
+        return contexts[0]
+    return {
+        "artifacts": contexts,
+        "instructions": "\n\n".join(dict.fromkeys(context["instructions"] for context in contexts)),
+    }
 
 
-def resolve_artifact_path(path: str) -> Optional[Path]:
+def resolve_artifact_path(path: str) -> Path | None:
     if not path:
         return None
     try:
@@ -113,10 +122,10 @@ def _read_and_truncate(path: Path, max_size: int, truncate_from: str = "start") 
             if len(content) > read_size:
                 content = content[-read_size:]
         else:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 # Read bounded lookahead before redacting the kept beginning.
                 content = f.read(read_size)
-    except (OSError, IOError) as e:
+    except OSError as e:
         get_logger().warning(f"Failed to read artifact file {path}: {e}")
         return ""
 
@@ -146,7 +155,26 @@ def _read_and_truncate(path: Path, max_size: int, truncate_from: str = "start") 
     return content
 
 
-def load_artifact_context() -> Optional[ArtifactPromptContext]:
+def _artifact_target_tools(value, default: frozenset[str]) -> frozenset[str]:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        value = [tool.strip() for tool in value.split(",") if tool.strip()]
+    if not isinstance(value, (list, set, tuple)):
+        return default
+    return frozenset(str(tool).lower() for tool in value)
+
+
+def _artifact_entries(artifacts_settings: dict) -> list[dict]:
+    paths = artifacts_settings.get("artifact_path", "")
+    if isinstance(paths, (list, tuple)):
+        entries = paths
+    else:
+        entries = [paths]
+    return [dict(entry) if isinstance(entry, Mapping) else {"path": entry} for entry in entries]
+
+
+def load_artifact_context() -> ArtifactPromptContext | None:
     try:
         artifacts_settings = get_settings().get("ARTIFACTS", {})
     except AttributeError:
@@ -161,16 +189,7 @@ def load_artifact_context() -> Optional[ArtifactPromptContext]:
     if not enable:
         return None
 
-    artifact_path_str = artifacts_settings.get("artifact_path", "")
-    if not artifact_path_str:
-        return None
-
-    artifact_path = resolve_artifact_path(artifact_path_str)
-    if not artifact_path:
-        get_logger().warning(
-            f"Artifact file not found or path rejected: '{artifact_path_str}' "
-            f"(GITHUB_WORKSPACE={os.environ.get('GITHUB_WORKSPACE', 'not set')})"
-        )
+    if not artifacts_settings.get("artifact_path", ""):
         return None
 
     try:
@@ -179,24 +198,67 @@ def load_artifact_context() -> Optional[ArtifactPromptContext]:
         max_size = 50000
     if max_size <= 0:
         max_size = 50000
-    truncate_from = artifacts_settings.get("truncate_from", "start")
-    content = _read_and_truncate(artifact_path, max_size, truncate_from)
-    if not content:
-        return None
-
-    label = (
-        _single_line_artifact_label(artifacts_settings.get("artifact_label", "") or "")
-        or _single_line_artifact_label(artifact_path.name)
-        or "CI artifact"
+    default_target_tools = _artifact_target_tools(
+        artifacts_settings.get("target_tools"), frozenset(SUPPORTED_ARTIFACT_TOOLS)
     )
-    start_marker, end_marker = _artifact_boundary_markers()
-    instructions = (artifacts_settings.get("artifact_instructions", "") or "").strip()
+    contexts = []
+    remaining_size = max_size
+    entries = _artifact_entries(artifacts_settings)
+    shared_label = artifacts_settings.get("artifact_label", "") if len(entries) == 1 else ""
+    for entry in entries:
+        path_value = entry.get("path", entry.get("artifact_path", ""))
+        if path_value and not isinstance(path_value, str):
+            get_logger().warning(
+                f"Skipping artifact entry with a non-string path: {path_value!r}"
+            )
+            continue
+        artifact_path = resolve_artifact_path(path_value) if path_value else None
+        if not artifact_path:
+            get_logger().warning(
+                f"Artifact file not found or path rejected: '{path_value}' "
+                f"(GITHUB_WORKSPACE={os.environ.get('GITHUB_WORKSPACE', 'not set')})"
+            )
+            continue
+        if remaining_size <= 0:
+            get_logger().warning(f"Artifact size budget exhausted before reading '{path_value}'")
+            break
+        content = _read_and_truncate(
+            artifact_path,
+            remaining_size,
+            entry.get("truncate_from", artifacts_settings.get("truncate_from", "start")),
+        )
+        if not content:
+            continue
+        label = (
+            _single_line_artifact_label(
+                entry.get("artifact_label", entry.get("label", shared_label))
+                or ""
+            )
+            or _single_line_artifact_label(artifact_path.name)
+            or "CI artifact"
+        )
+        start_marker, end_marker = _artifact_boundary_markers()
+        instructions = entry.get(
+            "artifact_instructions",
+            entry.get("instructions", artifacts_settings.get("artifact_instructions", "")),
+        ) or ""
+        instructions = instructions.strip()
+        contexts.append({
+            "label": label,
+            "content": content,
+            "instructions": instructions or DEFAULT_ARTIFACT_INSTRUCTIONS,
+            "start_marker": start_marker,
+            "end_marker": end_marker,
+            "target_tools": _artifact_target_tools(entry.get("target_tools"), default_target_tools),
+        })
+        remaining_size -= len(content)
+    if not contexts:
+        return None
+    if len(contexts) == 1:
+        return contexts[0]
     return {
-        "label": label,
-        "content": content,
-        "instructions": instructions or DEFAULT_ARTIFACT_INSTRUCTIONS,
-        "start_marker": start_marker,
-        "end_marker": end_marker,
+        "artifacts": contexts,
+        "instructions": "\n\n".join(dict.fromkeys(context["instructions"] for context in contexts)),
     }
 
 
@@ -234,20 +296,27 @@ def inject_artifact_context() -> None:
             return
         target_tools = get_settings().get(
             "ARTIFACTS.TARGET_TOOLS",
-            ["pr_reviewer", "pr_description", "pr_code_suggestions"]
+            ["pr_reviewer", "pr_description", "pr_code_suggestions", "pr_questions"]
         )
-        if isinstance(target_tools, str):
-            target_tools = [t.strip() for t in target_tools.split(",") if t.strip()]
-        requested_tools = frozenset(str(t).lower() for t in target_tools)
-        target_tools = requested_tools & SUPPORTED_ARTIFACT_TOOLS
-        unsupported_tools = sorted(requested_tools - SUPPORTED_ARTIFACT_TOOLS)
-        if unsupported_tools:
-            get_logger().warning(
-                f"Unsupported artifact target tools will be ignored: {unsupported_tools}"
-            )
-        if not target_tools:
+        default_target_tools = _artifact_target_tools(
+            target_tools, frozenset(SUPPORTED_ARTIFACT_TOOLS)
+        )
+        contexts = artifact_context.get("artifacts", [artifact_context])
+        by_tool = {tool: [] for tool in SUPPORTED_ARTIFACT_TOOLS}
+        for context in contexts:
+            requested_tools = context.get("target_tools", default_target_tools)
+            supported_tools = requested_tools & SUPPORTED_ARTIFACT_TOOLS
+            unsupported_tools = sorted(requested_tools - SUPPORTED_ARTIFACT_TOOLS)
+            if unsupported_tools:
+                get_logger().warning(
+                    f"Unsupported artifact target tools will be ignored: {unsupported_tools}"
+                )
+            for tool in supported_tools:
+                by_tool[tool].append(context)
+        by_tool = {tool: contexts for tool, contexts in by_tool.items() if contexts}
+        if not by_tool:
             return
-        _artifact_context.set((artifact_context, target_tools))
-        get_logger().info(f"Injected artifact context into tools: {target_tools}")
+        _artifact_context.set(by_tool)
+        get_logger().info(f"Injected artifact context into tools: {sorted(by_tool)}")
     except (OSError, ValueError, TypeError) as e:
         get_logger().warning(f"Failed to process artifacts: {e}", exc_info=True)

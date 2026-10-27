@@ -2,7 +2,7 @@ import copy
 import os
 import time
 import uuid
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import uvicorn
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -14,6 +14,7 @@ from starlette_context.middleware import RawContextMiddleware
 from pr_agent.agent.pr_agent import PRAgent, prepare_command
 from pr_agent.agent.request_policy import RequestOutcome
 from pr_agent.algo.run_details import command_failed, init_run_details
+from pr_agent.algo.setting_utils import normalize_setting_list
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers import get_git_provider, get_git_provider_with_context
 from pr_agent.git_providers.utils import apply_repo_settings
@@ -119,12 +120,12 @@ async def get_body(request):
     return body
 
 
-async def handle_comments_on_pr(body: Dict[str, Any],
+async def handle_comments_on_pr(body: dict[str, Any],
                                 event: str,
                                 sender: str,
                                 sender_id: str,
                                 action: str,
-                                log_context: Dict[str, Any],
+                                log_context: dict[str, Any],
                                 agent: PRAgent):
     if "comment" not in body:
         return {}
@@ -174,19 +175,19 @@ async def handle_comments_on_pr(body: Dict[str, Any],
         else:
             get_logger().info(f"User {sender=} is not eligible to process comment on PR {api_url=}")
 
-async def handle_new_pr_opened(body: Dict[str, Any],
+async def handle_new_pr_opened(body: dict[str, Any],
                                event: str,
                                sender: str,
                                sender_id: str,
                                action: str,
-                               log_context: Dict[str, Any],
+                               log_context: dict[str, Any],
                                agent: PRAgent):
 
     pull_request, api_url = _check_pull_request_event(action, body, log_context)
     if not (pull_request and api_url):
         get_logger().info(f"Invalid PR event: {action=} {api_url=}")
         return {}
-    if action in get_settings().github_app.handle_pr_actions:  # ['opened', 'reopened', 'ready_for_review']
+    if action in normalize_setting_list(get_settings().github_app.handle_pr_actions, split_commas=True):
         # logic to ignore PRs with specific titles (e.g. "[Auto] ...")
         apply_repo_settings(api_url)
         if get_identity_provider().verify_eligibility("github", sender_id, api_url) is not Eligibility.NOT_ELIGIBLE:
@@ -243,13 +244,13 @@ def _finish_auto_command_check_run(provider, name: str | None, command, succeede
         get_logger().warning(f"Failed to complete the {name} check run: {e}")
 
 
-async def handle_pull_request_review_submitted(body: Dict[str, Any],
+async def handle_pull_request_review_submitted(body: dict[str, Any],
                                                event: str,
                                                sender: str,
                                                sender_id: str,
                                                sender_type: str,
                                                action: str,
-                                               log_context: Dict[str, Any],
+                                               log_context: dict[str, Any],
                                                agent: PRAgent):
     pull_request, api_url = _check_pull_request_event(action, body, log_context)
     if not (pull_request and api_url):
@@ -291,12 +292,12 @@ async def handle_pull_request_review_submitted(body: Dict[str, Any],
         get_logger().info(f"User {sender=} is not eligible to process review on PR {api_url=}")
 
 
-async def handle_push_trigger_for_new_commits(body: Dict[str, Any],
+async def handle_push_trigger_for_new_commits(body: dict[str, Any],
                         event: str,
                         sender: str,
                         sender_id: str,
                         action: str,
-                        log_context: Dict[str, Any],
+                        log_context: dict[str, Any],
                         agent: PRAgent):
     pull_request, api_url = _check_pull_request_event(action, body, log_context)
     if not (pull_request and api_url):
@@ -308,7 +309,6 @@ async def handle_push_trigger_for_new_commits(body: Dict[str, Any],
     if not get_settings().github_app.handle_push_trigger:
         return {}
 
-    # TODO: do we still want to get the list of commits to filter bot/merge commits?
     before_sha = body.get("before")
     after_sha = body.get("after")
     merge_commit_sha = pull_request.get("merge_commit_sha")
@@ -380,7 +380,7 @@ def should_process_pr_logic(body) -> bool:
     return shared_should_process_pr_logic(body, provider="github")
 
 
-async def _dispatch_request(body: Dict[str, Any], event: str, action: str):
+async def _dispatch_request(body: dict[str, Any], event: str, action: str):
     """Return False when a command fails, preserving ignored events as completed work."""
     agent = PRAgent()
     log_context, sender, sender_id, sender_type = get_log_context(body, event, action, build_number)
@@ -424,7 +424,7 @@ async def _dispatch_request(body: Dict[str, Any], event: str, action: str):
     return {}
 
 
-async def handle_request(body: Dict[str, Any], event: str, delivery_id: str | None = None):
+async def handle_request(body: dict[str, Any], event: str, delivery_id: str | None = None):
     """
     Handle incoming GitHub webhook requests.
 
@@ -456,7 +456,7 @@ async def handle_request(body: Dict[str, Any], event: str, delivery_id: str | No
     return {}
 
 
-def _check_pull_request_event(action: str, body: dict, log_context: dict) -> Tuple[Dict[str, Any], str]:
+def _check_pull_request_event(action: str, body: dict, log_context: dict) -> tuple[dict[str, Any], str]:
     invalid_result = {}, ""
     pull_request = body.get("pull_request")
     if not pull_request:
@@ -493,7 +493,7 @@ async def _perform_auto_commands_github(commands_conf: str, agent: PRAgent, body
     commands = (
         get_pr_commands("github_app")
         if commands_conf == "pr_commands"
-        else get_settings().get(f"github_app.{commands_conf}")
+        else normalize_setting_list(get_settings().get(f"github_app.{commands_conf}"))
     )
     if not commands:
         get_logger().info(f"No {commands_conf} configured, skipping auto commands")

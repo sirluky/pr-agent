@@ -13,6 +13,13 @@ from pr_agent.git_providers import utils as git_utils
 from pr_agent.git_providers.github_provider import IncompletePullRequestFilesError
 
 
+@pytest.fixture(autouse=True)
+def _provider_key_gate_passes(monkeypatch):
+    """These flows test tools, not credentials; the key gate has its own test file.
+    Tests that need the gate can override the attribute again."""
+    monkeypatch.setattr(github_action_runner, "missing_provider_key_env_vars", lambda: None)
+
+
 def test_is_true_accepts_bool_and_case_insensitive_true_string():
     assert github_action_runner.is_true(True) is True
     assert github_action_runner.is_true(False) is False
@@ -550,6 +557,8 @@ async def test_review_comment_with_review_command_mentioning_ask_stays_review(
 ):
     handled = []
     _patch_issue_comment_deps(monkeypatch, handled)
+    monkeypatch.setattr(github_action_runner, "get_git_provider",
+                        lambda: pytest.fail("line comment should not construct a provider"))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request_review_comment")
     monkeypatch.setenv(
         "GITHUB_EVENT_PATH",
@@ -1189,6 +1198,8 @@ async def test_issue_comment_not_starting_with_slash_is_skipped(
 async def test_issue_comment_on_plain_issue_is_dispatched(monkeypatch, tmp_path, restore_github_settings):
     handled = []
     _patch_issue_comment_deps(monkeypatch, handled)
+    monkeypatch.setattr(github_action_runner, "get_git_provider",
+                        lambda: pytest.fail("plain issue should not construct a provider"))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_plain_issue_comment_event(tmp_path)))
     monkeypatch.setenv("GITHUB_TOKEN", "token")

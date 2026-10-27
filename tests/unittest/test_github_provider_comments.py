@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from github import GithubException
+from github.PullRequestComment import PullRequestComment
 from requests.exceptions import RequestException
 
 from pr_agent.git_providers import github_provider as gh_module
@@ -63,6 +64,23 @@ def _make_provider(pr=None, max_chars=65000):
     p.diff_files = []
     p.base_url = "https://api.github.com"
     return p
+
+
+@pytest.mark.parametrize(("comment_id", "expected_ids"), [(1, [1, 2]), (2, [1, 2]), (99, [])])
+def test_get_review_thread_comments_uses_list_payload_without_refetching(comment_id, expected_ids):
+    requester = MagicMock()
+    requester.requestJsonAndCheck.side_effect = AssertionError("The list response already contains the thread IDs")
+    payloads = [{"id": 1}, {"id": 3}, {"id": 2, "in_reply_to_id": 1}, {"id": 4, "in_reply_to_id": 3}]
+    # List-built objects remain completable; root payloads deliberately omit in_reply_to_id.
+    comments = [PullRequestComment(requester, {}, {
+        **payload, "url": f"https://api.github.com/repos/owner/repo/pulls/comments/{payload['id']}",
+    }) for payload in payloads]
+    provider = _make_provider(SimpleNamespace(get_comments=lambda: comments))
+
+    thread = provider.get_review_thread_comments(comment_id)
+
+    assert [comment.id for comment in thread] == expected_ids
+    requester.requestJsonAndCheck.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -471,6 +489,41 @@ def test_publish_code_suggestions_single_line_payload_shape():
     assert "start_line" not in payload and "start_side" not in payload
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param("**Suggestion:** fix\n```suggestion\n" + "A" * 100 + "\n```", "**Suggestion:** fix\n",
+                     id="drops-suggestion-block"),
+        pytest.param("A" * 100, "A" * 22 + "...", id="clamps-body-without-block"),
+    ],
+)
+def test_publish_code_suggestions_limits_body_length(body, expected):
+    """An oversized body drops its suggestion block before the clamp, so no truncated suggestion reaches GitHub."""
+    provider = _make_provider(max_chars=25)
+
+    payload = provider._build_code_suggestion_payload({
+        "body": body,
+        "relevant_file": "src/foo.py",
+        "relevant_lines_start": 7,
+        "relevant_lines_end": 7,
+    })
+
+    assert payload["body"] == expected
+
+
+def test_publish_code_suggestions_does_not_trim_short_body():
+    provider = _make_provider(max_chars=25)
+
+    payload = provider._build_code_suggestion_payload({
+        "body": "```suggestion\nfix\n```",
+        "relevant_file": "src/foo.py",
+        "relevant_lines_start": 7,
+        "relevant_lines_end": 7,
+    })
+
+    assert payload["body"] == "```suggestion\nfix\n```"
+
+
 def test_publish_code_suggestions_skips_invalid_ranges():
     """Suggestions with missing/negative start, or end<start, must be skipped silently."""
     provider = _make_provider()
@@ -736,6 +789,8 @@ def _make_graphql_response(data, errors=None):
 class _FakeRequester:
     """Records GraphQL calls and returns canned responses."""
 
+    graphql_url = "https://api.github.com/graphql"
+
     def __init__(self, responses):
         self.calls = []
         self._responses = list(responses)
@@ -750,6 +805,15 @@ class _FakeRequester:
     def requestJson(self, method, url, input=None):
         self.calls.append(("json", method, url, input))
         return self._responses.pop(0)
+
+    def graphql_query(self, query, variables):
+        response = self.requestJson("POST", self.graphql_url, input={"query": query, "variables": variables})
+        if isinstance(response, Exception):
+            raise response
+        data = json.loads(response[2])
+        if data.get("errors"):
+            raise GithubException(400, data, {})
+        return ({}, data)
 
 
 def _make_provider_with_graphql(rest_comment_data, graphql_responses):
@@ -780,9 +844,7 @@ class TestResolveCommentThread:
     def test_resolves_reply_after_first_hundred_comments(self):
         thread = {
             "id": "PRRT_target", "isResolved": False,
-            "comments": {"nodes": [{"id": "PRR_root"}] + [
-                {"id": f"PRR_reply_{i}"} for i in range(1, 100)
-            ]},
+            "comments": {"nodes": [{"id": "PRR_root"}]},
         }
         resolved = _make_graphql_response({"resolveReviewThread": {"thread": {"isResolved": True}}})
         provider, requester = _make_provider_with_graphql(
@@ -794,7 +856,9 @@ class TestResolveCommentThread:
         assert len(requester.calls) == 4
         assert requester.calls[0][2].endswith("/pulls/comments/123")
         assert requester.calls[1][:3] == ("check", "GET", "https://api.github.com/repos/owner/repo/pulls/comments/10")
-        assert "reviewThreads(first: 100)" in requester.calls[2][3]["query"]
+        assert "reviewThreads(first: 100, after: $cursor)" in requester.calls[2][3]["query"]
+        assert "comments(first: $comment_limit)" in requester.calls[2][3]["query"]
+        assert requester.calls[2][3]["variables"]["comment_limit"] == 1
         assert 'threadId: "PRRT_target"' in requester.calls[3][3]["query"]
 
     @pytest.mark.parametrize(
@@ -819,7 +883,8 @@ class TestResolveCommentThread:
         assert provider.resolve_comment_thread(123) is True
         assert len(requester.calls) == 4
         assert requester.calls[1][:3] == ("check", "GET", "https://api.github.com/repos/owner/repo/pulls/comments/10")
-        assert "reviewThreads(first: 100)" in requester.calls[2][3]["query"]
+        assert "reviewThreads(first: 100, after: $cursor)" in requester.calls[2][3]["query"]
+        assert requester.calls[2][3]["variables"]["comment_limit"] == 100
         assert 'threadId: "PRRT_target"' in requester.calls[3][3]["query"]
         logger.warning.assert_called_once_with(f"Could not fetch root of comment 123: status {expected_status}")
 
@@ -970,7 +1035,7 @@ class TestResolveCommentThread:
         result = provider.resolve_comment_thread(123)
 
         assert result is True
-        assert 'after: "cursor1"' in requester.calls[2][3]["query"]
+        assert requester.calls[2][3]["variables"]["cursor"] == "cursor1"
         assert "resolveReviewThread" in requester.calls[3][3]["query"]
 
     def test_handles_rest_api_exception(self):

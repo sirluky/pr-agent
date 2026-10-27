@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import traceback
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Callable, List, Tuple
 
 import openai
 
@@ -79,12 +79,27 @@ def _append_metadata_section(
     if whole_lines:
         lines = section.splitlines()
         # A heading without a filename conveys no useful filtered-file information.
-        for count in range(len(lines), 2, -1):
-            clipped_section = "\n".join(lines[:count])
-            candidate = final_diff + separator + clipped_section
-            candidate_tokens = token_handler.prompt_tokens + _count_raw_and_stripped_tokens(token_handler, candidate)
-            if candidate_tokens <= max_tokens:
-                return candidate, candidate_tokens, clipped_section
+        if len(lines) > 2:
+            heading, filenames = lines[:2], lines[2:]
+            result = (final_diff, curr_token, "")
+
+            def fits(prefix: list[str]) -> bool:
+                nonlocal result
+                clipped_section = "\n".join(heading + prefix)
+                candidate = final_diff + separator + clipped_section
+                candidate_tokens = token_handler.prompt_tokens + _count_raw_and_stripped_tokens(
+                    token_handler, candidate
+                )
+                if candidate_tokens <= max_tokens:
+                    result = (candidate, candidate_tokens, clipped_section)
+                    return True
+                return False
+
+            # Check the full section first to avoid extra probes in the common case.
+            if not fits(filenames):
+                # Accept only verified prefixes when token counts are non-monotone.
+                _find_verified_fitting_prefix_length(filenames, len(filenames) - 1, fits)
+            return result
     else:
         section_tokens = token_handler.count_tokens(section)
         clipped_section = clip_tokens(section, section_budget, num_input_tokens=section_tokens)
@@ -231,7 +246,9 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
     # generate a standard diff string, with patch extension
     patches_extended, total_tokens, patches_extended_tokens = pr_generate_extended_diff(
         pr_languages, token_handler, add_line_numbers_to_hunks,
-        patch_extra_lines_before=PATCH_EXTRA_LINES_BEFORE, patch_extra_lines_after=PATCH_EXTRA_LINES_AFTER)
+        patch_extra_lines_before=PATCH_EXTRA_LINES_BEFORE, patch_extra_lines_after=PATCH_EXTRA_LINES_AFTER,
+        # Retain per-file counts when filtered-file metadata may force repacking.
+        skip_file_tokens_below=None if filtered_files else soft_token_budget)
 
     # if we are under the limit, return the full diff
     if not patches_extended:
@@ -260,6 +277,7 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
             if first_name not in included_section.splitlines():
                 full_diff_is_usable = False
                 get_logger().info("Full diff left no room for filtered filenames; repacking")
+                del full_diff, full_diff_with_metadata
             else:
                 full_diff = full_diff_with_metadata
         if full_diff_is_usable:
@@ -268,6 +286,9 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                                       add_line_numbers_to_hunks=add_line_numbers_to_hunks,
                                       token_handler=token_handler, attempt_budget=budget)
             return full_diff
+
+    # Release the discarded full diff before constructing compressed patches.
+    del patches_extended
 
     # if we are over the limit, start pruning (If we got here, we will not extend the patches with extra lines)
     get_logger().info(f"Tokens: {total_tokens}, total tokens over limit: {budget.context_window}, "
@@ -411,7 +432,7 @@ def _pack_pr_multi_diffs(file_dict: dict,
                          return_remaining_files: bool,
                          token_budget: int,
                          *, return_coverage: bool = False):
-    """Pack diffs additively, then verify each rendered group against the input budget."""
+    """Pack diffs lazily, then verify each rendered group against the input budget."""
     final_diff_list = []
     files_in_patches = set()
     clipped_files = set()
@@ -421,6 +442,9 @@ def _pack_pr_multi_diffs(file_dict: dict,
         return _count_raw_and_stripped_tokens(token_handler, rendered)
 
     def clip_single_patch(filename, patch):
+        if file_dict[filename].get("content_fetch_failed", False):
+            get_logger().warning(f"Unreadable-file notice too large, skipping: {filename}")
+            return None
         if get_settings().config.get("large_patch_policy", "skip") != "clip":
             get_logger().warning(f"Patch too large, skipping: {filename}")
             return None
@@ -440,37 +464,38 @@ def _pack_pr_multi_diffs(file_dict: dict,
             get_logger().info(f"Clipped large patch for file: {filename}")
         return filename, patch_clipped, clipped_tokens
 
-    packable = []
-    for filename, data in file_dict.items():
-        patch = data["patch"]
-        new_patch_tokens = data["tokens"]
-        if not patch:
-            continue
-
-        if new_patch_tokens > token_budget:
-            clipped_item = clip_single_patch(filename, patch)
-            if not clipped_item:
-                continue
-            filename, patch, new_patch_tokens = clipped_item
-
-        packable.append((filename, patch, new_patch_tokens))
-
+    packable_count = 0
+    source_exhausted = False
     separator_tokens = token_handler.count_tokens("\n")
-    additive_groups = []
-    current_group = []
-    current_tokens = 0
-    for item in packable:
-        item_tokens = item[2]
-        item_cost = item_tokens + (separator_tokens if current_group else 0)
-        if current_group and current_tokens + item_cost > token_budget:
-            additive_groups.append(current_group)
-            current_group = []
-            current_tokens = 0
-            item_cost = item_tokens
-        current_group.append(item)
-        current_tokens += item_cost
-    if current_group:
-        additive_groups.append(current_group)
+
+    def iter_additive_groups():
+        nonlocal packable_count, source_exhausted
+        current_group = []
+        current_tokens = 0
+        for filename, data in file_dict.items():
+            patch = data["patch"]
+            new_patch_tokens = data["tokens"]
+            if not patch:
+                continue
+            if new_patch_tokens > token_budget:
+                clipped_item = clip_single_patch(filename, patch)
+                if not clipped_item:
+                    continue
+                filename, patch, new_patch_tokens = clipped_item
+            item = (filename, patch, new_patch_tokens)
+            packable_count += 1
+            item_cost = new_patch_tokens + (separator_tokens if current_group else 0)
+            if current_group and current_tokens + item_cost > token_budget:
+                # Count the lookahead item so an omitted file keeps the final chunk untrimmed.
+                yield current_group
+                current_group = []
+                current_tokens = 0
+                item_cost = new_patch_tokens
+            current_group.append(item)
+            current_tokens += item_cost
+        source_exhausted = True
+        if current_group:
+            yield current_group
 
     packed_groups = []
 
@@ -481,8 +506,10 @@ def _pack_pr_multi_diffs(file_dict: dict,
         files_in_patches.update(filename for filename, _, _ in group)
         return True
 
-    for group in additive_groups:
-        if len(packed_groups) >= max_calls:
+    additive_groups = iter_additive_groups()
+    while len(packed_groups) < max_calls:
+        group = next(additive_groups, None)
+        if group is None:
             break
 
         pending_group = group
@@ -508,14 +535,14 @@ def _pack_pr_multi_diffs(file_dict: dict,
                 append_group([clipped_item])
             pending_group = pending_group[1:]
 
-    packed_all = len(files_in_patches) == len(packable)
+    packed_all = source_exhausted and len(files_in_patches) == packable_count
     for index, group in enumerate(packed_groups):
         rendered_chunk = "\n".join(patch for _, patch, _ in group)
         if packed_all and index == len(packed_groups) - 1:
             rendered_chunk = rendered_chunk.strip("\r\n")
         final_diff_list.append(rendered_chunk)
 
-    if len(files_in_patches) < len(packable) and get_verbosity_level() >= 2:
+    if len(files_in_patches) < packable_count and get_verbosity_level() >= 2:
         get_logger().info(f"Reached max calls ({max_calls})")
 
     if not return_remaining_files and not return_coverage:
@@ -588,10 +615,16 @@ def pr_generate_extended_diff(pr_languages: list,
                               add_line_numbers_to_hunks: bool,
                               patch_extra_lines_before: int = 0,
                               patch_extra_lines_after: int = 0,
-                              deleted_files: list | None = None) -> Tuple[list, int, list]:
+                              deleted_files: list | None = None,
+                              *, skip_file_tokens_below: int | None = None) -> tuple[list, int, list]:
+    """Render patches; optionally skip per-file counts below a diff-only token threshold.
+
+    Leave file.tokens unchanged and return an empty per-patch count list when skipping.
+    """
     total_tokens = token_handler.prompt_tokens  # initial tokens
     patches_extended = []
     patches_extended_tokens = []
+    rendered_files = []
     for lang in pr_languages:
         for file in lang['files']:
             original_file_content_str = file.base_file
@@ -603,9 +636,8 @@ def pr_generate_extended_diff(pr_languages: list,
                 # See _unreadable_file_notice: the file is kept, but as a notice rather than a
                 # fabricated diff, so the model knows this part of the PR was not reviewed.
                 full_extended_patch = _unreadable_file_notice(file)
-                file.tokens = token_handler.count_tokens(full_extended_patch)
-                patches_extended_tokens.append(file.tokens)
                 patches_extended.append(full_extended_patch)
+                rendered_files.append(file)
                 continue
 
             if deleted_files is not None:
@@ -633,13 +665,16 @@ def pr_generate_extended_diff(pr_languages: list,
             if file.ai_file_summary and get_settings().get("config.enable_ai_metadata", False):
                 full_extended_patch = add_ai_summary_top_patch(file, full_extended_patch)
 
-            patch_tokens = token_handler.count_tokens(full_extended_patch)
-            file.tokens = patch_tokens
-            patches_extended_tokens.append(patch_tokens)
             patches_extended.append(full_extended_patch)
+            rendered_files.append(file)
 
     if patches_extended:
         total_tokens += _count_raw_and_stripped_tokens(token_handler, "\n".join(patches_extended))
+    if skip_file_tokens_below is None or total_tokens - token_handler.prompt_tokens >= skip_file_tokens_below:
+        # Preserve extended-patch ordering whenever the caller needs to compress or split the diff.
+        for file, patch in zip(rendered_files, patches_extended, strict=True):
+            file.tokens = token_handler.count_tokens(patch)
+            patches_extended_tokens.append(file.tokens)
     return patches_extended, total_tokens, patches_extended_tokens
 
 
@@ -647,7 +682,7 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler,
                                 soft_token_budget: int, hard_token_budget: int,
                                 convert_hunks_to_line_numbers: bool,
                                 large_pr_handling: bool,
-                                ) -> Tuple[list, list, list, list, dict, list]:
+                                ) -> tuple[list, list, list, list, dict, list]:
     """Prepare patches using the caller's soft and hard diff-only capacities."""
     deleted_files_list = []
 
@@ -677,6 +712,7 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler,
                 'patch': note,
                 'tokens': token_handler.count_tokens(note),
                 'edit_type': file.edit_type,
+                'content_fetch_failed': True,
             }
             continue
 
@@ -812,13 +848,19 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
                                      git_provider: GitProvider | None = None):
     all_models = _get_all_models(model_type)
     all_deployments = _get_all_deployments(all_models)
-    routed = route_primary_model(model_type, git_provider)
-    if routed:
-        # A cheaper primary for a small pull request; config.fallback_models still follow it.
-        all_models[0], all_deployments[0] = routed
     # Ignore surplus deployment entries when fewer fallback models are configured; this matches
     # the existing retry loop, which stops as soon as the first successful model returns.
-    effective_chain = tuple(zip(all_models, all_deployments[:len(all_models)], strict=True))
+    configured_chain = tuple(zip(all_models, all_deployments[:len(all_models)], strict=True))
+    effective_chain = configured_chain
+    routed = route_primary_model(model_type, git_provider)
+    if routed:
+        effective_chain = (routed, *configured_chain[1:])
+        # Routing treats empty deployment IDs as absent; compare equivalent endpoint pairs.
+        normalized_chain = tuple((model, deployment or None) for model, deployment in configured_chain)
+        if routed in normalized_chain[1:]:
+            # Retain the displaced primary, appending it only when it is not already present.
+            # Keep other fallbacks in order and distinguish deployments of the same model.
+            effective_chain = tuple(dict.fromkeys((routed, *normalized_chain[1:], normalized_chain[0])))
     original_deployment_id = get_settings().get("openai.deployment_id", None)
     context_token = _effective_fallback_chain.set(effective_chain)
     attempt_errors = []
@@ -840,9 +882,9 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
                     f"Failed to generate prediction with {model}",
                     artifact={"error": e},
                 )
-                if i == len(all_models) - 1:  # If it's the last iteration
+                if i == len(effective_chain) - 1:  # If it's the last iteration
                     raise Exception(
-                        f"Failed to generate prediction with any model of {all_models}. "
+                        f"Failed to generate prediction with any model of {[model for model, _ in effective_chain]}. "
                         f"Attempts: {'; '.join(attempt_errors)}"
                     ) from e
             else:
@@ -853,7 +895,7 @@ async def retry_with_fallback_models(f: Callable, model_type: ModelType = ModelT
         get_settings().set("openai.deployment_id", original_deployment_id)
 
 
-def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:
+def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> list[str]:
     if model_type == ModelType.WEAK:
         model = get_model('model_weak')
     elif model_type == ModelType.REASONING:
@@ -870,7 +912,7 @@ def _get_all_models(model_type: ModelType = ModelType.REGULAR) -> List[str]:
     return all_models
 
 
-def _get_all_deployments(all_models: List[str]) -> List[str]:
+def _get_all_deployments(all_models: list[str]) -> list[str]:
     deployment_id = get_settings().get("openai.deployment_id", None)
     fallback_deployments = get_settings().get("openai.fallback_deployments", [])
     if not isinstance(fallback_deployments, list) and fallback_deployments:
@@ -994,7 +1036,8 @@ def get_pr_multi_diffs(git_provider: GitProvider,
         add_line_numbers_to_hunks=add_line_numbers,
         patch_extra_lines_before=PATCH_EXTRA_LINES_BEFORE,
         patch_extra_lines_after=PATCH_EXTRA_LINES_AFTER,
-        deleted_files=deleted_files)
+        deleted_files=deleted_files,
+        skip_file_tokens_below=soft_token_budget)
 
     # if we are under the limit, return the full diff
     if total_tokens - token_handler.prompt_tokens < soft_token_budget:
@@ -1004,6 +1047,9 @@ def get_pr_multi_diffs(git_provider: GitProvider,
         else:
             result = (full_diff_list, []) if return_remaining_files else full_diff_list
         return include_filtered_files(result)
+
+    # Release the discarded full diff before constructing chunked patches.
+    del patches_extended
 
     # Sort files within each language group by tokens in descending order
     sorted_files = []
@@ -1019,6 +1065,15 @@ def get_pr_multi_diffs(git_provider: GitProvider,
         new_file_content_str = file.head_file
         patch = file.patch
         if not patch:
+            if not getattr(file, "content_fetch_failed", False):
+                continue
+            notice = _unreadable_file_notice(file)
+            file_dict[file.filename] = {
+                'patch': notice,
+                'tokens': token_handler.count_tokens(notice),
+                'edit_type': file.edit_type,
+                'content_fetch_failed': True,
+            }
             continue
 
         # Remove delete-only hunks

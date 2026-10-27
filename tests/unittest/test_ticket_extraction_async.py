@@ -196,6 +196,28 @@ def settings_snapshot():
 # ---------------------------------------------------------------------------
 
 class TestGithubExtractionMerging:
+    def test_equivalent_references_across_sources_leave_room_for_distinct_issues(self, settings_snapshot):
+        repo_obj = _FakeRepoObj({n: _FakeIssue(n) for n in (7, 8, 9)})
+        provider = _make_github_provider(
+            user_description="https://github.com/ORG/REPO/issues/007 #8",
+            branch="feature/7-duplicate",
+            repo_obj=repo_obj,
+        )
+        provider.pr = SimpleNamespace(title="Fixes #9")
+        result = asyncio.run(extract_tickets(provider))
+        assert [ticket["ticket_id"] for ticket in result] == [7, 8, 9]
+        assert repo_obj.get_issue_calls == [7, 8, 9]
+
+    def test_oversized_zero_padded_reference_does_not_hide_valid_issue(self, settings_snapshot):
+        repo_obj = _FakeRepoObj({7: _FakeIssue(7), 8: _FakeIssue(8)})
+        long_url = f"https://github.com/org/repo/issues/{'0' * 4301}7"
+        provider = _make_github_provider(
+            user_description=f"{long_url} #7 #8", repo_obj=repo_obj,
+        )
+        result = asyncio.run(extract_tickets(provider))
+        assert [ticket["ticket_id"] for ticket in result] == [7, 8]
+        assert repo_obj.get_issue_calls == [7, 8]
+
     def test_skipped_pr_does_not_displace_later_issue(self, settings_snapshot):
         repo_obj = _FakeRepoObj({
             1: _FakeIssue(1, raw_data={"pull_request": {"url": "pr"}}),
@@ -1010,6 +1032,72 @@ class TestGetIssueFailureIsolated:
 # ---------------------------------------------------------------------------
 
 class TestSubIssues:
+    @pytest.mark.parametrize("sub_url", [
+        "https://github.com/ORG/REPO/issues/002",
+        "https://api.github.com/repos/ORG/REPO/issues/002",
+    ], ids=["web", "api"])
+    @pytest.mark.parametrize("order", [(1, 2), (2, 1)])
+    def test_direct_and_sub_issue_share_reads_within_each_extraction(self, settings_snapshot, order, sub_url):
+        child = _FakeIssue(2, title="Child", labels=[_FakeLabel("bug")])
+        repo_obj = _FakeRepoObj({1: _FakeIssue(1, title="Parent"), 2: child})
+        provider = _make_github_provider(
+            user_description="Fixes " + " and ".join(f"#{number}" for number in order),
+            repo_obj=repo_obj,
+            sub_issues_map={"https://github.com/org/repo/issues/1": [sub_url]},
+        )
+
+        for body in ("Original body", "Updated body"):
+            child.body = body
+            result = asyncio.run(extract_tickets(provider))
+            assert [ticket["ticket_id"] for ticket in result] == list(order)
+            parent_ticket = next(ticket for ticket in result if ticket["ticket_id"] == 1)
+            child_ticket = next(ticket for ticket in result if ticket["ticket_id"] == 2)
+            assert parent_ticket["sub_issues"] == [{
+                "ticket_url": sub_url,
+                "title": "Child",
+                "body": body,
+                "labels": "bug",
+            }]
+            assert child_ticket["body"] == body
+            assert child_ticket["labels"] == "bug"
+
+        assert repo_obj.get_issue_calls == list(order) * 2
+
+    def test_failed_sub_issue_read_can_succeed_as_direct_reference(self, settings_snapshot):
+        parent = _FakeIssue(1, title="Parent")
+        child = _FakeIssue(2, title="Child")
+        repo_obj = _FakeRepoObj()
+        repo_obj.get_issue = MagicMock(side_effect=[parent, RuntimeError("temporary failure"), child])
+        provider = _make_github_provider(
+            user_description="Fixes #1 and #2",
+            repo_obj=repo_obj,
+            sub_issues_map={"https://github.com/org/repo/issues/1": ["https://github.com/org/repo/issues/2"]},
+        )
+
+        result = asyncio.run(extract_tickets(provider))
+
+        assert [call.args[0] for call in repo_obj.get_issue.call_args_list] == [1, 2, 2]
+        assert [ticket["title"] for ticket in result] == ["Parent", "Child"]
+        assert result[0]["sub_issues"] == []
+
+    def test_same_issue_number_in_different_repositories_is_not_reused(self, settings_snapshot):
+        settings_snapshot.set("config.repo_context_sibling_repos", ["org/other"])
+        repo_obj = _FakeRepoObj({1: _FakeIssue(1, title="Parent"), 2: _FakeIssue(2, title="Local")})
+        other = _FakeRepoObj({2: _FakeIssue(2, title="Other")})
+        provider = _make_github_provider(
+            user_description="Fixes #1 and #2",
+            repo_obj=repo_obj,
+            github_client=_FakeGithubClient({"org/other": other}),
+            sub_issues_map={"https://github.com/org/repo/issues/1": ["https://github.com/org/other/issues/2"]},
+        )
+
+        result = asyncio.run(extract_tickets(provider))
+
+        assert [ticket["title"] for ticket in result] == ["Parent", "Local"]
+        assert result[0]["sub_issues"][0]["title"] == "Other"
+        assert repo_obj.get_issue_calls == [1, 2]
+        assert other.get_issue_calls == [2]
+
     def test_sub_issue_success_populates_and_truncates(self, settings_snapshot):
         long_sub_body = "y" * 10500
         repo_obj = _FakeRepoObj({
@@ -1237,6 +1325,102 @@ class TestGitLabExtraction:
                 "https://gitlab.com",
                 [("group/repo", 7)],
             ),
+            (
+                'https://gitlab.com:443/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com',
+                [("group/repo", 7)],
+            ),
+            (
+                'https://gitlab.com/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com:443',
+                [("group/repo", 7)],
+            ),
+            (
+                'http://gitlab.com:80/group/repo/-/issues/7',
+                "group/repo",
+                'http://gitlab.com',
+                [("group/repo", 7)],
+            ),
+            (
+                'http://gitlab.com/group/repo/-/issues/7',
+                "group/repo",
+                'http://gitlab.com:80',
+                [("group/repo", 7)],
+            ),
+            (
+                'https://GITLAB.com/group/repo/-/issues/7',
+                "group/repo",
+                'HTTPS://GitLab.COM',
+                [("group/repo", 7)],
+            ),
+            (
+                'https://user:password@gitlab.com/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com',
+                [("group/repo", 7)],
+            ),
+            (
+                'https://gitlab.com@other.example/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com',
+                [],
+            ),
+            (
+                'http://gitlab.com/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com',
+                [],
+            ),
+            (
+                'https://gitlab.com:8443/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com',
+                [],
+            ),
+            (
+                'https://gitlab.com/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com:8443',
+                [],
+            ),
+            (
+                'https://gitlab.com:8444/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com:8443',
+                [],
+            ),
+            (
+                'https://gitlab.com:bad/group/repo/-/issues/7 #8',
+                "group/repo",
+                'https://gitlab.com',
+                [("group/repo", 8)],
+            ),
+            (
+                'https://gitlab.com:65536/group/repo/-/issues/7 #8',
+                "group/repo",
+                'https://gitlab.com',
+                [("group/repo", 8)],
+            ),
+            (
+                'https://gitlab.com/group/repo/-/issues/7 #8',
+                "group/repo",
+                'https://gitlab.com:bad',
+                [("group/repo", 8)],
+            ),
+            (
+                'https://gitlab.com/group/repo/-/issues/7 #8',
+                "group/repo",
+                'ftp://gitlab.com',
+                [("group/repo", 8)],
+            ),
+            (
+                'https://gitlab.com/gitlab-other/group/repo/-/issues/7',
+                "group/repo",
+                'https://gitlab.com/gitlab',
+                [],
+            ),
         ],
     )
     def test_url_reference_boundaries(self, description, repo_path, gitlab_url, expected):
@@ -1278,6 +1462,37 @@ class TestGitLabExtraction:
         ]
         provider.gl.projects.get.assert_called_once_with("group/repo", lazy=True)
         project.issues.get.assert_called_once_with(7)
+
+    @pytest.mark.parametrize("source", ["description", "title"])
+    @pytest.mark.parametrize(
+        ("linked_origin", "accepted"),
+        [("http://gitlab.com", False), ("https://gitlab.com:8443", False), ("https://gitlab.com:443", True)],
+    )
+    def test_full_url_origin_controls_sdk_lookup(self, source, linked_origin, accepted, settings_snapshot):
+        reference = f"{linked_origin}/group/repo/-/issues/7"
+        provider, project = _make_gitlab_provider(reference if source == "description" else "")
+        provider.mr = SimpleNamespace(title=reference if source == "title" else "No ticket", source_branch="main")
+        # Derive the configured project from an MR URL accepted by the provider.
+        provider.id_project, _ = provider._parse_merge_request_url(
+            "https://gitlab.com/group/repo/-/merge_requests/4"
+        )
+
+        result = asyncio.run(extract_tickets(provider))
+
+        if not accepted:
+            assert result == []
+            provider.gl.projects.get.assert_not_called()
+            project.issues.get.assert_not_called()
+        else:
+            assert result == [{
+                "ticket_id": 7,
+                "ticket_url": "https://gitlab.com/group/repo/-/issues/7",
+                "title": "GitLab issue",
+                "body": "Issue body",
+                "labels": "bug, backend",
+            }]
+            provider.gl.projects.get.assert_called_once_with("group/repo", lazy=True)
+            project.issues.get.assert_called_once_with(7)
 
 
 # ---------------------------------------------------------------------------
@@ -1416,6 +1631,8 @@ class TestExtractAndCachePrTickets:
 class _FakeRequester:
     """Mimic PyGithub's private requester: ``requestJson`` -> (status, headers, body)."""
 
+    graphql_url = "https://api.github.com/graphql"
+
     def __init__(self, responses):
         self._responses = list(responses)
         self.queries = []
@@ -1494,7 +1711,6 @@ class TestFetchSubIssuesNullGraphQLFields:
             "not raise into the broad except"
         )
         assert "Issue ID not found" in logs
-        # The second (sub-issues) query must not be attempted.
         assert len(provider.github_client._Github__requester.queries) == 1
 
     def test_null_repository_is_handled_without_traceback(self):
@@ -1507,11 +1723,10 @@ class TestFetchSubIssuesNullGraphQLFields:
         assert "Failed to fetch sub-issues" not in logs
         assert "Issue ID not found" in logs
 
-    def test_null_node_in_sub_issues_response_is_handled_without_traceback(self):
-        """The second query resolves the issue id; ``node`` may still be null."""
+    def test_null_sub_issues_response_is_handled_without_traceback(self):
+        """The issue can resolve even when its sub-issues data is null."""
         responses = [
-            {"data": {"repository": {"issue": {"id": "I_kwDO_fake"}}}},
-            {"data": {"node": None}},
+            {"data": {"repository": {"issue": {"id": "I_kwDO_fake", "subIssues": None}}}},
         ]
         provider = _provider_with_graphql(responses)
 
@@ -1528,10 +1743,10 @@ class TestFetchSubIssuesNullGraphQLFields:
             for number in range(1, 12)
         }
         responses = [
-            {"data": {"repository": {"issue": {"id": "I_kwDO_fake"}}}},
-            {"data": {"node": {"subIssues": {"nodes": [
-                {"url": url} for url in sub_issue_urls
-            ]}}}},
+            {"data": {"repository": {"issue": {
+                "id": "I_kwDO_fake",
+                "subIssues": {"nodes": [{"url": url} for url in sub_issue_urls]},
+            }}}},
         ]
         provider = _provider_with_graphql(responses)
 
@@ -1540,5 +1755,6 @@ class TestFetchSubIssuesNullGraphQLFields:
         assert result == sub_issue_urls
         assert "Failed to fetch sub-issues" not in logs
         queries = provider.github_client._Github__requester.queries
-        assert len(queries) == 2
-        assert "subIssues(first: 100)" in queries[1]
+        assert len(queries) == 1
+        assert "issue(number: 89)" in queries[0]
+        assert "subIssues(first: 100)" in queries[0]
