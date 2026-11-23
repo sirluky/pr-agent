@@ -6,7 +6,7 @@ import pytest
 
 from pr_agent.algo.comment_identity import PRReviewHeader
 from pr_agent.algo.utils import _expand_minute_suffix, convert_to_markdown_v2
-from pr_agent.tools.pr_description import insert_br_after_x_chars
+from pr_agent.commands.pr_description import insert_br_after_x_chars
 
 """
 Code Analysis
@@ -192,6 +192,44 @@ class TestConvertToMarkdown:
 
         assert '<strong></strong><br>The function needs review.' in output
 
+    @pytest.mark.parametrize("gfm", [True, False])
+    def test_summary_shows_fix_for_findings_left_in_summary(self, gfm):
+        issue = {
+            'relevant_file': 'src/utils.py',
+            'issue_header': 'Code Smell',
+            'issue_content': 'The function is too long.',
+            'start_line': 30,
+            'end_line': 50,
+            'improved_code': 'x = 1\n```\nprint(x)',
+        }
+        input_data = {'review': {'key_issues_to_review': [issue]}}
+
+        output = convert_to_markdown_v2(input_data, gfm_supported=gfm)
+
+        fix_block = "````text\nx = 1\n```\nprint(x)\n````"
+        assert fix_block in output
+        assert output.index('The function is too long.') < output.index(fix_block)
+        assert ('<details><summary>Suggested fix</summary>' in output) is gfm
+        assert ('**Suggested fix**' in output) is not gfm
+
+    @pytest.mark.parametrize("gfm,expected", [
+        (True, "<strong>Code Smell</strong><br>The function is too long.\n\n"),
+        (False, "**Code Smell**\n\nThe function is too long.\n\n\n\n"),
+    ])
+    def test_summary_without_fix_renders_unchanged(self, gfm, expected):
+        issue = {
+            'relevant_file': 'src/utils.py',
+            'issue_header': 'Code Smell',
+            'issue_content': 'The function is too long.',
+            'improved_code': '   ',
+        }
+        output = convert_to_markdown_v2({'review': {'key_issues_to_review': [issue]}}, gfm_supported=gfm)
+        del issue['improved_code']
+        baseline = convert_to_markdown_v2({'review': {'key_issues_to_review': [issue]}}, gfm_supported=gfm)
+
+        assert expected in output
+        assert output == baseline
+
     def test_ticket_compliance(self):
         input_data = {'review': {
             'ticket_compliance_check': [
@@ -249,64 +287,142 @@ class TestConvertToMarkdown:
         assert '[]()' not in output
         assert '**Untracked ticket - Fully compliant**' in output
 
-    def test_can_be_split(self):
+    @pytest.mark.parametrize('ticket_url, not_compliant, expected_header', [
+        (None, None, '**Untracked ticket - Fully compliant**'),
+        ('https://example.com/ticket/123', ['Requirement 2'],
+         '**[123](https://example.com/ticket/123) - Partially compliant**'),
+    ])
+    def test_ticket_compliance_accepts_null_and_list_fields(self, ticket_url, not_compliant, expected_header):
+        # Models may leave an empty field as YAML null and answer a bullet list as a YAML list.
         input_data = {'review': {
-            'can_be_split': [
+            'ticket_compliance_check': [
                 {
-                    'relevant_files': [
-                        'src/file1.py',
-                        'src/file2.py'
-                    ],
-                    'title': 'Refactoring',
-                },
-                {
-                    'relevant_files': [
-                        'src/file3.py'
-                    ],
-                    'title': 'Bug Fix',
+                    'ticket_url': ticket_url,
+                    'fully_compliant_requirements': ['Requirement 1'],
+                    'not_compliant_requirements': not_compliant,
+                    'requires_further_human_verification': None,
                 }
             ]
-        }
-        }
+        }}
 
-        expected_output = textwrap.dedent("""\
+        output = convert_to_markdown_v2(input_data)
+
+        assert expected_header in output
+        assert 'Compliant requirements:\n\n- Requirement 1' in output
+        assert ('Non-compliant requirements:\n\n- Requirement 2' in output) == bool(not_compliant)
+
+    _CAN_BE_SPLIT_INPUT = {'review': {
+        'can_be_split': [
+            {
+                'relevant_files': [
+                    'src/file1.py',
+                    'src/file2.py'
+                ],
+                'title': 'Refactoring',
+            },
+            {
+                'relevant_files': [
+                    'src/file3.py'
+                ],
+                'title': 'Bug Fix',
+            }
+        ]
+    }
+    }
+
+    _CAN_BE_SPLIT_EXPECTED_OUTPUT = textwrap.dedent("""\
+        ## PR Reviewer Guide 🔍
+
+        Here are some key observations to aid the review process:
+
+        <table>
+        <tr><td>🔀 <strong>Multiple PR themes</strong><br><br>
+
+        <details><summary>
+        Sub-PR theme: <b>Refactoring</b></summary>
+
+        ___
+
+        Relevant files:
+
+        - src/file1.py
+        - src/file2.py
+        ___
+
+        </details>
+
+        <details><summary>
+        Sub-PR theme: <b>Bug Fix</b></summary>
+
+        ___
+
+        Relevant files:
+
+        - src/file3.py
+        ___
+
+        </details>
+
+        </td></tr>
+        </table>
+    """)
+
+    def test_can_be_split(self):
+        assert convert_to_markdown_v2(self._CAN_BE_SPLIT_INPUT).strip() == self._CAN_BE_SPLIT_EXPECTED_OUTPUT.strip()
+
+    @pytest.mark.parametrize("theme_count", [2, 3])
+    def test_can_be_split_non_gfm(self, theme_count):
+        themes = self._CAN_BE_SPLIT_INPUT["review"]["can_be_split"] + [
+            {"title": "Documentation", "relevant_files": ["docs/usage.md"]}
+        ]
+        expected = textwrap.dedent("""\
             ## PR Reviewer Guide 🔍
 
             Here are some key observations to aid the review process:
 
-            <table>
-            <tr><td>🔀 <strong>Multiple PR themes</strong><br><br>
+            ### 🔀 Multiple PR themes
 
-            <details><summary>
-            Sub-PR theme: <b>Refactoring</b></summary>
-
-            ___
+            #### Sub-PR theme: Refactoring
 
             Relevant files:
 
             - src/file1.py
             - src/file2.py
-            ___
 
-            </details>
-
-            <details><summary>
-            Sub-PR theme: <b>Bug Fix</b></summary>
-
-            ___
+            #### Sub-PR theme: Bug Fix
 
             Relevant files:
 
             - src/file3.py
-            ___
-
-            </details>
-
-            </td></tr>
-            </table>
         """)
+        if theme_count == 3:
+            expected += textwrap.dedent("""
+                #### Sub-PR theme: Documentation
 
-        assert convert_to_markdown_v2(input_data).strip() == expected_output.strip()
+                Relevant files:
+
+                - docs/usage.md
+            """)
+        output = convert_to_markdown_v2({"review": {"can_be_split": themes[:theme_count]}}, gfm_supported=False)
+        assert output.strip() == expected.strip()
+
+    @pytest.mark.parametrize("themes", [
+        [],
+        [{"title": "Only one", "relevant_files": ["src/file1.py"]}],
+        [{"title": "Missing files"}, {"title": "Valid", "relevant_files": []}],
+        [{"title": "Invalid", "relevant_files": "src/file1.py"}, {"title": "Valid", "relevant_files": []}],
+        _CAN_BE_SPLIT_INPUT["review"]["can_be_split"] * 2,
+    ])
+    def test_can_be_split_non_gfm_without_valid_multiple_themes(self, themes):
+        expected = textwrap.dedent("""\
+            ## PR Reviewer Guide 🔍
+
+            Here are some key observations to aid the review process:
+        """)
+        with patch('pr_agent.algo.utils.get_logger') as get_logger:
+            output = convert_to_markdown_v2({"review": {"can_be_split": themes}}, gfm_supported=False)
+        assert output.strip() == expected.strip()
+        get_logger.return_value.exception.assert_not_called()
 
     def test_contribution_time_cost_estimate(self):
         input_data = {
@@ -438,8 +554,11 @@ class TestConvertToMarkdown:
         )
         mode = {"what": "Partial write", "where": "app.py:save", "trigger": "Write fails",
                 "detected_by": "Write failure test", "covered_in_this_pr": False}
-        markdown = convert_to_markdown_v2({"review": {"failure_modes": [mode] * 4}}, gfm_supported=gfm_supported)
+        modes = [{**mode, "what": f"Partial write {index}"} for index in range(1, 5)]
+        markdown = convert_to_markdown_v2({"review": {"failure_modes": modes}}, gfm_supported=gfm_supported)
         assert markdown.count("Partial write") == 3
+        assert all(f"Partial write {index}" in markdown for index in range(1, 4))
+        assert "Partial write 4" not in markdown
 
     # Tests that the function works correctly with an empty dictionary input
     def test_empty_dictionary_input(self):

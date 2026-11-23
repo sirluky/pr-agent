@@ -3,19 +3,22 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from azure.devops.released.git import GitCommitRef, GitUserDate
 
 from pr_agent.algo.comment_identity import PRReviewIdentity
+from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.git_providers import AzureDevopsProvider
 from pr_agent.git_providers.azuredevops_provider import _AzureCommitAdapter, _to_naive_utc
 from pr_agent.git_providers.git_provider import IncrementalPR
 
 
-def _raw_commit(commit_id, comment, author_date, parents=None):
+def _raw_commit(commit_id, comment, author_date, parents=None, committer_date=None):
     raw = MagicMock()
     raw.commit_id = commit_id
     raw.comment = comment
     raw.author = MagicMock()
     raw.author.date = author_date
+    raw.committer = SimpleNamespace(date=committer_date) if committer_date else None
     raw.parents = parents or []
     return raw
 
@@ -56,15 +59,44 @@ class TestAzureCommitAdapter:
         assert adapter.commit.author.date.tzinfo is None
         assert adapter.parents == ["p1"]
 
+    def test_exposes_committer_date_as_naive_utc(self):
+        # An amend or rebase keeps the author date and moves the committer date.
+        utc_plus_2 = _dt.timezone(_dt.timedelta(hours=2))
+        raw = GitCommitRef(
+            commit_id="abc123", comment="amended", parents=["p1"],
+            author=GitUserDate(date=_dt.datetime(2024, 5, 31, 16, 0, tzinfo=_dt.UTC)),
+            committer=GitUserDate(date=_dt.datetime(2024, 6, 2, 11, 0, tzinfo=utc_plus_2)),
+        )
+
+        adapter = _AzureCommitAdapter(raw)
+
+        assert adapter.commit.author.date == _dt.datetime(2024, 5, 31, 16, 0)
+        assert adapter.commit.committer.date == _dt.datetime(2024, 6, 2, 9, 0)
+
     def test_handles_missing_author(self):
         raw = MagicMock()
         raw.commit_id = "x"
         raw.comment = ""
         raw.author = None
+        raw.committer = None
         raw.parents = None
         adapter = _AzureCommitAdapter(raw)
         assert adapter.commit.author.date is None
+        assert adapter.commit.committer.date is None
         assert adapter.parents == []
+
+    def test_missing_author_date_takes_the_committer_date(self):
+        # _get_commit_range can pick the last-seen commit by its committer date, and PRReviewer
+        # then compares that commit's author date, which must not be None.
+        raw = GitCommitRef(
+            commit_id="abc123", comment="", parents=["p1"],
+            committer=GitUserDate(date=_dt.datetime(2024, 5, 30, 10, 0, tzinfo=_dt.UTC)),
+        )
+
+        adapter = _AzureCommitAdapter(raw)
+
+        assert adapter.commit.author.date == _dt.datetime(2024, 5, 30, 10, 0)
+        assert adapter.commit.committer.date == _dt.datetime(2024, 5, 30, 10, 0)
 
 
 class TestGetIncrementalCommits:
@@ -170,12 +202,6 @@ class TestGetIncrementalCommits:
 
         assert provider.get_previous_review(full=True, incremental=False) is agent
 
-    def test_supports_review_and_suggestions_kinds(self):
-        provider = self._make_provider()
-
-        assert provider.supports_incremental_kind("review") is True
-        assert provider.supports_incremental_kind("suggestions") is True
-        assert provider.supports_incremental_kind("unknown") is False
 
     @pytest.mark.parametrize("suggestions_header", [
         "## PR Code Suggestions ✨",
@@ -398,6 +424,81 @@ class TestGetIncrementalCommits:
         assert provider.incremental.last_seen_commit.sha == "old1"
         assert provider.incremental.first_new_commit.sha == "mid"
 
+    @pytest.mark.parametrize("kind", ["review", "suggestions"])
+    def test_amended_commit_pushed_after_review_is_new(self, kind):
+        # Amend, rebase and cherry-pick keep the author date. c2 was written before the review,
+        # then amended and force-pushed after it, so only its committer date shows it is new.
+        provider = self._make_provider()
+        review_time = _dt.datetime(2024, 6, 1, 12, 0, tzinfo=_dt.UTC)
+        seen = _raw_commit(
+            "c1", "seen", _dt.datetime(2024, 5, 30, 10, 0, tzinfo=_dt.UTC), parents=["base"],
+            committer_date=_dt.datetime(2024, 5, 30, 10, 0, tzinfo=_dt.UTC),
+        )
+        amended = _raw_commit(
+            "c2", "amended", _dt.datetime(2024, 5, 31, 16, 0, tzinfo=_dt.UTC), parents=["c1"],
+            committer_date=_dt.datetime(2024, 6, 2, 9, 0, tzinfo=_dt.UTC),
+        )
+        provider.azure_devops_client.get_pull_request_commits.return_value = [amended, seen]
+        provider.get_issue_comments = MagicMock(return_value=[
+            _comment("## PR Reviewer Guide", review_time),
+            _comment("## PR Code Suggestions", review_time),
+        ])
+        provider.azure_devops_client.get_changes.return_value = SimpleNamespace(
+            changes=[{"item": {"path": "/src/parser.py", "gitObjectType": "blob"}}],
+        )
+
+        provider.get_incremental_commits(IncrementalPR(True), kind=kind)
+
+        assert provider.incremental.is_incremental is True
+        assert [c.sha for c in provider.incremental.commits_range] == ["c2"]
+        assert provider.incremental.last_seen_commit_sha == "c1"
+        assert provider.unreviewed_files_map == {"/src/parser.py": "/src/parser.py"}
+        provider.azure_devops_client.get_changes.assert_called_once_with(
+            project="ws", repository_id="repo", commit_id="c2",
+        )
+
+    def test_branch_rebased_after_review_falls_back_to_full_review(self):
+        # A rebase rewrites every commit, so none of them is the reviewed baseline any more.
+        provider = self._make_provider()
+        review_time = _dt.datetime(2024, 6, 1, 12, 0, tzinfo=_dt.UTC)
+        rebased_at = _dt.datetime(2024, 6, 2, 9, 0, tzinfo=_dt.UTC)
+        first = _raw_commit(
+            "c1", "first", _dt.datetime(2024, 5, 30, 10, 0, tzinfo=_dt.UTC), parents=["base"],
+            committer_date=rebased_at,
+        )
+        second = _raw_commit(
+            "c2", "second", _dt.datetime(2024, 5, 31, 16, 0, tzinfo=_dt.UTC), parents=["c1"],
+            committer_date=rebased_at,
+        )
+        provider.azure_devops_client.get_pull_request_commits.return_value = [second, first]
+        provider.get_issue_comments = MagicMock(return_value=[_comment("## PR Reviewer Guide", review_time)])
+
+        provider.get_incremental_commits(IncrementalPR(True))
+
+        assert provider.incremental.is_incremental is False
+        assert provider.incremental.commits_range is None
+        assert provider.incremental.last_seen_commit is None
+        provider.azure_devops_client.get_changes.assert_not_called()
+
+    @pytest.mark.parametrize("committer", [None, SimpleNamespace(date=None)])
+    def test_missing_committer_date_falls_back_to_author_date(self, committer):
+        provider = self._make_provider()
+        review_time = _dt.datetime(2024, 6, 1, 12, 0, tzinfo=_dt.UTC)
+        seen = _raw_commit("c1", "seen", _dt.datetime(2024, 5, 30, 10, 0, tzinfo=_dt.UTC), parents=["base"])
+        new = _raw_commit("c2", "new", _dt.datetime(2024, 6, 2, 9, 0, tzinfo=_dt.UTC), parents=["c1"])
+        seen.committer = new.committer = committer
+        provider.azure_devops_client.get_pull_request_commits.return_value = [new, seen]
+        provider.get_issue_comments = MagicMock(return_value=[_comment("## PR Reviewer Guide", review_time)])
+        provider.azure_devops_client.get_changes.return_value = SimpleNamespace(
+            changes=[{"item": {"path": "/src/parser.py", "gitObjectType": "blob"}}],
+        )
+
+        provider.get_incremental_commits(IncrementalPR(True))
+
+        assert provider.incremental.is_incremental is True
+        assert [c.sha for c in provider.incremental.commits_range] == ["c2"]
+        assert provider.incremental.last_seen_commit_sha == "c1"
+
     def test_incremental_resets_stale_diff_cache(self):
         # Regression for Qodo #1: switching a reused provider into incremental mode must
         # invalidate any diff_files cached by a prior full get_diff_files(), so the incremental
@@ -506,12 +607,163 @@ class TestIncrementalDiffHead:
             for call in logger.return_value.warning.call_args_list
         )
 
+    def test_incremental_added_file_edited_after_baseline_diffs_against_baseline(self):
+        provider = self._provider(source_head="commit-2")
+        provider._get_pr_iteration_changes = MagicMock(return_value=[
+            {"item": {"path": self.PATH, "gitObjectType": "blob"}, "changeType": "add"},
+        ])
+        self._activate_incremental(provider)
+
+        def get_item(**kwargs):
+            ver = kwargs["version_descriptor"].version
+            if ver == "commit-2":
+                return SimpleNamespace(content="line1\nline2\nline3_edited\n")
+            if ver == "last-seen-source":
+                return SimpleNamespace(content="line1\nline2\nline3\n")
+            raise AssertionError(f"Unexpected version: {ver}")
+
+        provider.azure_devops_client.get_item = MagicMock(side_effect=get_item)
+
+        diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.edit_type == EDIT_TYPE.MODIFIED
+        assert diff_file.base_file == "line1\nline2\nline3\n"
+        assert diff_file.head_file == "line1\nline2\nline3_edited\n"
+        assert diff_file.content_fetch_failed is False
+        assert "-line3" in diff_file.patch
+        assert "+line3_edited" in diff_file.patch
+        assert "+line1" not in diff_file.patch
+        assert provider.unreviewed_files_map[self.PATH] == diff_file.patch
+
+    def test_incremental_newly_added_file_missing_at_baseline_stays_added(self):
+        provider = self._provider(source_head="commit-2")
+        provider._get_pr_iteration_changes = MagicMock(return_value=[
+            {"item": {"path": self.PATH, "gitObjectType": "blob"}, "changeType": "add"},
+        ])
+        self._activate_incremental(provider)
+
+        not_found = RuntimeError("Item not found")
+        not_found.type_key = "GitItemNotFoundException"
+
+        def get_item(**kwargs):
+            ver = kwargs["version_descriptor"].version
+            if ver == "commit-2":
+                return SimpleNamespace(content="brand_new\n")
+            if ver == "last-seen-source":
+                raise not_found
+            raise AssertionError(f"Unexpected version: {ver}")
+
+        provider.azure_devops_client.get_item = MagicMock(side_effect=get_item)
+
+        diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.edit_type == EDIT_TYPE.ADDED
+        assert diff_file.base_file == ""
+        assert diff_file.content_fetch_failed is False
+        assert "+brand_new" in diff_file.patch
+
+    def test_incremental_added_file_non_404_baseline_error_fails_closed(self):
+        provider = self._provider(source_head="commit-2")
+        provider._get_pr_iteration_changes = MagicMock(return_value=[
+            {"item": {"path": self.PATH, "gitObjectType": "blob"}, "changeType": "add"},
+        ])
+        self._activate_incremental(provider)
+
+        server_error = RuntimeError("Service unavailable")
+        server_error.status_code = 500
+
+        def get_item(**kwargs):
+            ver = kwargs["version_descriptor"].version
+            if ver == "commit-2":
+                return SimpleNamespace(content="brand_new\n")
+            if ver == "last-seen-source":
+                raise server_error
+            raise AssertionError(f"Unexpected version: {ver}")
+
+        provider.azure_devops_client.get_item = MagicMock(side_effect=get_item)
+
+        diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.content_fetch_failed is True
+        assert diff_file.patch == ""
+
+    @pytest.mark.parametrize("path", ["/errors/http-404.html", "/errors/status404.html"])
+    def test_incremental_added_file_error_mentioning_404_in_path_fails_closed(self, path):
+        provider = self._provider(source_head="commit-2")
+        provider._get_pr_iteration_changes = MagicMock(return_value=[
+            {"item": {"path": path, "gitObjectType": "blob"}, "changeType": "add"},
+        ])
+        provider.diff_files = None
+        provider.incremental = IncrementalPR(True)
+        provider.incremental.last_seen_commit = SimpleNamespace(sha="last-seen-source")
+        provider.unreviewed_files_map = {path: "stale patch"}
+
+        def get_item(**kwargs):
+            ver = kwargs["version_descriptor"].version
+            if ver == "commit-2":
+                return SimpleNamespace(content="<h1>404</h1>\n")
+            if ver == "last-seen-source":
+                raise RuntimeError(f"Access denied reading {path}")
+            raise AssertionError(f"Unexpected version: {ver}")
+
+        provider.azure_devops_client.get_item = MagicMock(side_effect=get_item)
+
+        diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.content_fetch_failed is True
+        assert diff_file.patch == ""
+
+    @pytest.mark.parametrize("message", [
+        "Operation returned a 404 status code.",
+        "404: Not Found",
+        "(404) Not Found",
+        "status_code=404",
+        "statusCode: 404",
+        "HTTP/1.1 404",
+    ])
+    def test_incremental_added_file_explicit_404_messages_stay_added(self, message):
+        provider = self._provider(source_head="commit-2")
+        provider._get_pr_iteration_changes = MagicMock(return_value=[
+            {"item": {"path": self.PATH, "gitObjectType": "blob"}, "changeType": "add"},
+        ])
+        self._activate_incremental(provider)
+
+        def get_item(**kwargs):
+            ver = kwargs["version_descriptor"].version
+            if ver == "commit-2":
+                return SimpleNamespace(content="brand_new\n")
+            if ver == "last-seen-source":
+                raise RuntimeError(message)
+            raise AssertionError(f"Unexpected version: {ver}")
+
+        provider.azure_devops_client.get_item = MagicMock(side_effect=get_item)
+
+        diff_file = provider.get_diff_files()[0]
+
+        assert diff_file.edit_type == EDIT_TYPE.ADDED
+        assert diff_file.content_fetch_failed is False
+        assert "+brand_new" in diff_file.patch
+
+    def test_full_review_added_file_skips_base_read(self):
+        provider = self._provider(source_head="commit-2")
+        provider._get_pr_iteration_changes = MagicMock(return_value=[
+            {"item": {"path": self.PATH, "gitObjectType": "blob"}, "changeType": "add"},
+        ])
+        provider.diff_files = None
+        provider.incremental = IncrementalPR(False)
+        provider.unreviewed_files_map = {}
+        requested = self._record_versions(provider)
+
+        diff_file = provider.get_diff_files()[0]
+
+        assert requested == ["merge-commit"]
+        assert diff_file.edit_type == EDIT_TYPE.ADDED
+
 
 class TestPrReviewerGuard:
     def test_can_run_returns_false_when_commits_range_none(self):
-        from pr_agent.tools.pr_reviewer import PRReviewer
+        from pr_agent.commands.pr_reviewer import PRReviewer
         reviewer = PRReviewer.__new__(PRReviewer)
-        reviewer.is_auto = False
         reviewer.pr_url = "u"
         reviewer.incremental = IncrementalPR(True)
         # incremental.commits_range stays None — provider has the method but didn't populate it.

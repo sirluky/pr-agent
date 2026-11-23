@@ -23,6 +23,7 @@ from pr_agent.algo import (
     GPT6_MODELS_WITHOUT_NONE_EFFORT,
     token_budget,
 )
+from pr_agent.algo.ai_handlers.cloud_auth import PROVIDER_API_BASE_ENV_VARS
 
 # Environment variables that LiteLLMAIHandler.__init__ reads or mutates: the AWS
 # credential path (entered when AWS_USE_IMDS is set) writes the AWS_* variables,
@@ -155,6 +156,12 @@ class TestOpenRouterAttribution:
         }
 
     def test_other_providers_and_global_header_guard(self, monkeypatch):
+        # The routing guard reads the provider's api_base variables from the live
+        # environment and refuses the request when one is set and no api_base was
+        # resolved, so a developer shell that exports ANTHROPIC_BASE_URL (or
+        # ANTHROPIC_API_BASE) would fail this test. Clear them first.
+        for variable in PROVIDER_API_BASE_ENV_VARS["anthropic"]:
+            monkeypatch.delenv(variable, raising=False)
         assert self._headers({"X-Trace": "keep"}, provider="anthropic") == {"X-Trace": "keep"}
         monkeypatch.setattr(litellm, "headers", {"X-Global": "blocked"})
         with pytest.raises(ValueError, match="process-wide LiteLLM headers fallback"):
@@ -373,6 +380,9 @@ class TestOpenRouterControls:
         [
             "openrouter/google/gemini-3.7-flash",
             "openrouter/google/gemini-3.8-flash:nitro",
+            "openrouter/google/gemini-4-argon",
+            "openrouter/google/gemini-4-hydrogen",
+            "openrouter/google/gemini-4-hydrogen:nitro",
         ],
     )
     async def test_gemini_none_uses_low_reasoning_floor(self, monkeypatch, model):
@@ -380,20 +390,101 @@ class TestOpenRouterControls:
         assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
 
     @pytest.mark.asyncio
-    async def test_gemini_inherited_none_uses_low_reasoning_floor(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("model", "global_effort", "expected_effort"),
+        [
+            ("openrouter/google/gemini-3.7-flash", "none", "low"),
+            ("openrouter/google/gemini-4-argon", "none", "low"),
+            ("openrouter/google/gemini-4-argon:nitro", "xhigh", "high"),
+            ("openrouter/google/gemini-4-argon:floor", "max", "high"),
+            ("openrouter/google/gemini-4-hydrogen", "none", "low"),
+            ("openrouter/google/gemini-4-hydrogen:nitro", "minimal", "low"),
+            ("openrouter/google/gemini-4-hydrogen:nitro", "xhigh", "xhigh"),
+            ("openrouter/google/gemini-4-hydrogen:floor", "max", "xhigh"),
+        ],
+    )
+    async def test_gemini_inherited_effort_uses_bounds(self, monkeypatch, model, global_effort, expected_effort):
         kwargs = await _run(
             monkeypatch,
-            "openrouter/google/gemini-3.7-flash",
+            model,
             {},
-            reasoning_effort="none",
+            reasoning_effort=global_effort,
         )
-        assert kwargs["extra_body"]["reasoning"] == {"effort": "low"}
+        assert kwargs["extra_body"]["reasoning"] == {"effort": expected_effort}
 
     @pytest.mark.asyncio
-    async def test_gemini_explicit_minimal_is_preserved(self, monkeypatch):
+    async def test_gemini_google_probe_respects_custom_llm_provider_override(self, monkeypatch):
+        openrouter_kwargs = await _run(
+            monkeypatch,
+            "openrouter/google/gemini-4-hydrogen",
+            {},
+            reasoning_effort="xhigh",
+        )
+        assert openrouter_kwargs["extra_body"]["reasoning"] == {"effort": "xhigh"}
+
+        overridden_kwargs = await _run(
+            monkeypatch,
+            "openrouter/google/gemini-4-hydrogen",
+            {},
+            reasoning_effort="xhigh",
+            custom_llm_provider="ollama",
+        )
+        assert "reasoning_effort" not in overridden_kwargs
+        assert "extra_body" not in overridden_kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "openrouter/google/gemini-1.5-pro",
+            "openrouter/google/gemini-3.1-pro",
+            "openrouter/google/gemini-omni-1.2-flash",
+        ],
+    )
+    async def test_unscoped_openrouter_google_models_do_not_inherit_effort(self, monkeypatch, model):
         kwargs = await _run(
             monkeypatch,
+            model,
+            {},
+            reasoning_effort="high",
+        )
+        assert "extra_body" not in kwargs
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("model", "explicit_effort", "expected_effort"),
+        [
+            ("openrouter/google/gemini-3.7-flash", "xhigh", "high"),
+            ("openrouter/google/gemini-3.8-flash:nitro", "max", "high"),
+            ("openrouter/google/gemini-4-argon", "xhigh", "high"),
+            ("openrouter/google/gemini-4-argon:floor", "max", "high"),
+            ("openrouter/google/gemini-4-hydrogen", "xhigh", "xhigh"),
+            ("openrouter/google/gemini-4-hydrogen:nitro", "max", "xhigh"),
+        ],
+    )
+    async def test_gemini_explicit_upper_effort_clamps_to_ceiling(
+        self, monkeypatch, model, explicit_effort, expected_effort
+    ):
+        kwargs = await _run(
+            monkeypatch,
+            model,
+            {"reasoning_effort": explicit_effort},
+        )
+        assert kwargs["extra_body"]["reasoning"] == {"effort": expected_effort}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
             "openrouter/google/gemini-3.7-flash",
+            "openrouter/google/gemini-4-argon",
+            "openrouter/google/gemini-4-hydrogen",
+        ],
+    )
+    async def test_gemini_explicit_minimal_is_preserved(self, monkeypatch, model):
+        kwargs = await _run(
+            monkeypatch,
+            model,
             {"reasoning_effort": "minimal"},
         )
         assert kwargs["extra_body"]["reasoning"] == {"effort": "minimal"}
@@ -499,8 +590,13 @@ class TestOpenRouterControls:
         assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
 
     @pytest.mark.asyncio
-    async def test_gemini_none_keeps_reasoning_budget(self, monkeypatch):
-        kwargs = await _run(monkeypatch, "openrouter/google/gemini-3.7-flash", {
+    @pytest.mark.parametrize("model", [
+        "openrouter/google/gemini-3.7-flash",
+        "openrouter/google/gemini-4-argon",
+        "openrouter/google/gemini-4-hydrogen",
+    ])
+    async def test_gemini_none_keeps_reasoning_budget(self, monkeypatch, model):
+        kwargs = await _run(monkeypatch, model, {
             "reasoning_effort": "none",
             "reasoning_max_tokens": 2048,
         })

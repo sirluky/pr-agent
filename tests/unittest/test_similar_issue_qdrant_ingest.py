@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import pr_agent.tools.pr_similar_issue as psi
+import pr_agent.commands.pr_similar_issue as psi
 
 
 class _PandasSeries(list):
@@ -163,19 +163,18 @@ def _install_fakes(monkeypatch, client):
     monkeypatch.setattr(psi, "_embed_with_fallback", _fake_embed)
 
 
-def _make_tool(monkeypatch, client):
+def _make_command(monkeypatch, client):
     _install_fakes(monkeypatch, client)
-    tool = psi.PRSimilarIssue.__new__(psi.PRSimilarIssue)
-    tool.qdrant = client
-    tool.qdrant_collection_name = "codium-ai-pr-agent-issues-v2"
-    tool.max_issues_to_scan = 100
-    tool.token_handler = SimpleNamespace(count_tokens=lambda _: 0)
-    tool._process_issue = lambda issue: (
+    command = psi.PRSimilarIssue.__new__(psi.PRSimilarIssue)
+    command.qdrant = client
+    command.qdrant_collection_name = "codium-ai-pr-agent-issues-v2"
+    command.max_issues_to_scan = 100
+    command._process_issue = lambda issue: (
         f"title: {issue.title}\nbody: {issue.body}",
         [],
         issue.number,
     )
-    return tool
+    return command
 
 
 class SettingsStub:
@@ -220,19 +219,14 @@ def _stub_constructor_dependencies(monkeypatch, client, issues):
 
     monkeypatch.setattr(psi, "get_git_provider", lambda: provider_factory)
     monkeypatch.setattr(psi, "_provider_supports_issue_indexing", lambda: True)
-    monkeypatch.setattr(
-        psi,
-        "TokenHandler",
-        lambda *args, **kwargs: SimpleNamespace(count_tokens=lambda text: 0),
-    )
 
 
 def test_qdrant_sentinel_is_the_final_point_of_a_full_ingest(monkeypatch):
     """Submit the completion sentinel in a separate call after every issue point."""
     client = FakeQdrantClient()
-    tool = _make_tool(monkeypatch, client)
+    command = _make_command(monkeypatch, client)
 
-    tool._update_qdrant_with_issues([_make_issue(2), _make_issue(1)], "example-repo", ingest=True)
+    command._update_qdrant_with_issues([_make_issue(2), _make_issue(1)], "example-repo", ingest=True)
 
     assert client.deletes == ["example_issue_example-repo"]
     assert len(client.upserts) == 2
@@ -245,21 +239,19 @@ def test_qdrant_sentinel_is_the_final_point_of_a_full_ingest(monkeypatch):
 def test_qdrant_oversized_issues_do_not_burn_the_scan_budget(monkeypatch):
     """Oversized rejects are not counted so the scan budget reaches older index gaps."""
     client = FakeQdrantClient()
-    tool = _make_tool(monkeypatch, client)
-    tool.max_issues_to_scan = 2
-    tool.token_handler = SimpleNamespace(count_tokens=lambda _: 10 ** 6)
-    monkeypatch.setattr(psi, "get_max_tokens", lambda model: 8192)
+    command = _make_command(monkeypatch, client)
+    command.max_issues_to_scan = 2
 
     oversized = SimpleNamespace(
         pull_request=False,
         title="Oversized",
-        body="x" * 9000,
+        body="🧪" * 4000,
         number=1,
         user=SimpleNamespace(login="user"),
         created_at="2020-01-01",
         get_comments=lambda: [],
     )
-    tool._update_qdrant_with_issues(
+    command._update_qdrant_with_issues(
         [oversized, _make_issue(2), _make_issue(3), _make_issue(4)],
         "example-repo",
         ingest=True,
@@ -271,7 +263,7 @@ def test_qdrant_oversized_issues_do_not_burn_the_scan_budget(monkeypatch):
     assert [point.payload["id"] for point in sentinel_points] == ["example_issue_example-repo"]
 
 
-def test_qdrant_collection_without_sentinel_reingests_full(monkeypatch):
+def test_qdrant_collection_without_sentinel_reingests_full(monkeypatch, github_issue_pages):
     """Re-ingest the whole repo when an existing collection holds no sentinel.
 
     An interrupted full ingest leaves the collection populated but sentinel-free, so the
@@ -279,7 +271,7 @@ def test_qdrant_collection_without_sentinel_reingests_full(monkeypatch):
     """
     client = _StatefulQdrantClient(ids={"issue_5.issue"})
     _stub_constructor_dependencies(
-        monkeypatch, client, issues=[_make_issue(5), _make_issue(4)]
+        monkeypatch, client, issues=github_issue_pages((5, 4))
     )
 
     psi.PRSimilarIssue("https://github.com/Example/Repo/issues/1", ai_handler=None)
@@ -315,7 +307,7 @@ def test_qdrant_full_ingest_stops_fetching_after_the_scan_limit(monkeypatch):
     assert client.upserts[1] == ["example_issue_example-repo"]
 
 
-def test_qdrant_incremental_backfills_an_older_index_gap(monkeypatch):
+def test_qdrant_incremental_backfills_an_older_index_gap(monkeypatch, github_issue_pages):
     """Keep scanning past indexed issues and backfill an older missing issue.
 
     With the sentinel and the newest issue already indexed, a deleted older issue must be
@@ -334,7 +326,7 @@ def test_qdrant_incremental_backfills_an_older_index_gap(monkeypatch):
     }
     client.ids.update(client.payload_overrides)
     _stub_constructor_dependencies(
-        monkeypatch, client, issues=[_make_issue(number) for number in (5, 4, 3, 2, 6, 7, 8, 9, 10)]
+        monkeypatch, client, issues=github_issue_pages((5, 4, 3, 2, 6, 7, 8, 9, 10))
     )
 
     psi.PRSimilarIssue("https://github.com/Example/Repo/issues/1", ai_handler=None)

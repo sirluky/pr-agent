@@ -24,6 +24,7 @@ from pr_agent.algo.review_finding_state import (
 )
 from pr_agent.algo.run_details import command_failed
 from pr_agent.algo.token_budget import FallbackEligibleError
+from pr_agent.commands.pr_reviewer import PRReviewer
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
 from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
@@ -34,7 +35,6 @@ from pr_agent.git_providers.gitea_provider import GiteaProvider
 from pr_agent.git_providers.github_provider import GithubProvider
 from pr_agent.git_providers.gitlab_provider import GitLabProvider
 from pr_agent.git_providers.local_git_provider import LocalGitProvider
-from pr_agent.tools.pr_reviewer import PRReviewer
 
 
 def _reviewer(provider):
@@ -60,12 +60,12 @@ def _finding(body="The lock is never released."):
 
 def _settings(monkeypatch):
     settings = get_settings()
-    monkeypatch.setattr(settings.config, "publish_output", True)
-    monkeypatch.setattr(settings.config, "is_auto_command", False, raising=False)
-    monkeypatch.setattr(settings.pr_reviewer, "persistent_comment", True)
-    monkeypatch.setattr(settings.pr_reviewer, "persistent_finding_state", True, raising=False)
-    monkeypatch.setattr(settings.pr_reviewer, "inline_key_issues", False)
-    monkeypatch.setattr(settings.pr_reviewer, "publish_output_no_suggestions", False)
+    monkeypatch.setitem(settings.config, "publish_output", True)
+    monkeypatch.setitem(settings.config, "is_auto_command", False)
+    monkeypatch.setitem(settings.pr_reviewer, "persistent_comment", True)
+    monkeypatch.setitem(settings.pr_reviewer, "persistent_finding_state", True)
+    monkeypatch.setitem(settings.pr_reviewer, "inline_key_issues", False)
+    monkeypatch.setitem(settings.pr_reviewer, "publish_output_no_suggestions", False)
     return settings
 
 
@@ -127,8 +127,8 @@ def test_review_finding_keeps_start_line_when_end_line_is_missing(end_line):
         "end_line": end_line,
     }
     finding = PRReviewer._review_finding_from_issue(issue)
-    assert finding["line_start"] == 5
-    assert finding["line_end"] == 5
+    assert finding.line_start == 5
+    assert finding.line_end == 5
 
 
 def test_build_key_issue_comment_keeps_start_line_when_end_line_is_null():
@@ -142,7 +142,9 @@ def test_build_key_issue_comment_keeps_start_line_when_end_line_is_null():
     diff_files = {"src/app.py": SimpleNamespace(filename="src/app.py", head_file="a\nb\nc\nd\ne\nf\n")}
     reviewer = PRReviewer.__new__(PRReviewer)
 
-    comment = reviewer._build_key_issue_comment(issue, diff_files)
+    comment = reviewer._build_key_issue_comment(
+        PRReviewer._review_finding_from_issue(issue), diff_files
+    )
 
     assert comment is not None
     assert comment["relevant_lines_start"] == 5
@@ -177,9 +179,9 @@ def test_prepare_review_reconciles_previous_state_and_renders_resolved_section(m
     reviewer = _reviewer(provider)
 
     with (
-        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value={"review": {"key_issues_to_review": []}}),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
-        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="No major issues detected"),
+        patch("pr_agent.commands.pr_reviewer.load_yaml", return_value={"review": {"key_issues_to_review": []}}),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.convert_to_markdown_v2", return_value="No major issues detected"),
     ):
         review = reviewer._prepare_pr_review()
 
@@ -242,10 +244,10 @@ async def test_prepare_review_pushes_final_markdown_with_lifecycle_state(monkeyp
     reviewer = _reviewer(provider)
 
     with (
-        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value={"review": {"key_issues_to_review": []}}),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
-        patch("pr_agent.tools.pr_reviewer.convert_to_markdown_v2", return_value="No major issues detected"),
-        patch("pr_agent.tools.pr_reviewer.push_outputs_async") as push_outputs,
+        patch("pr_agent.commands.pr_reviewer.load_yaml", return_value={"review": {"key_issues_to_review": []}}),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.convert_to_markdown_v2", return_value="No major issues detected"),
+        patch("pr_agent.commands.pr_reviewer.push_outputs_async") as push_outputs,
     ):
         review = reviewer._prepare_pr_review()
         await reviewer._deliver_sink_output()
@@ -332,7 +334,7 @@ def test_load_review_finding_state_accepts_default_heading_with_full_identity():
 
 def test_load_review_finding_state_accepts_custom_heading_with_full_identity(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "review_heading", "Team Review", raising=False)
+    monkeypatch.setitem(settings.pr_reviewer, "review_heading", "Team Review")
     previous = reconcile_review_findings(
         None,
         [_finding()],
@@ -515,7 +517,7 @@ def test_load_review_finding_state_skips_newer_comment_without_marker():
 
 def test_malformed_marker_self_heals_with_valid_marker(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 3)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 3)
     header = f"{PRReviewHeader.REGULAR.value} 🔍"
     comment = SimpleNamespace(
         body=f"{header}\n\nold review\n\n<!-- pr-agent-review-state:v1\nbad\n-->"
@@ -543,12 +545,12 @@ def test_malformed_marker_self_heals_with_valid_marker(monkeypatch):
 
     with (
         patch(
-            "pr_agent.tools.pr_reviewer.load_yaml",
+            "pr_agent.commands.pr_reviewer.load_yaml",
             return_value={"review": {"key_issues_to_review": [issue]}},
         ),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
         patch(
-            "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+            "pr_agent.commands.pr_reviewer.convert_to_markdown_v2",
             return_value=f"{header}\n\nclean review",
         ),
     ):
@@ -574,7 +576,7 @@ def test_malformed_marker_self_heals_with_valid_marker(monkeypatch):
 
 def test_prepare_and_persisted_state_round_trip_preserves_marker_and_history(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 3)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 3)
     header = f"{PRReviewHeader.REGULAR.value} 🔍"
     previous = reconcile_review_findings(
         None,
@@ -615,12 +617,12 @@ def test_prepare_and_persisted_state_round_trip_preserves_marker_and_history(mon
 
     with (
         patch(
-            "pr_agent.tools.pr_reviewer.load_yaml",
+            "pr_agent.commands.pr_reviewer.load_yaml",
             return_value={"review": {"key_issues_to_review": [issue]}},
         ),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
         patch(
-            "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+            "pr_agent.commands.pr_reviewer.convert_to_markdown_v2",
             return_value=f"{header}\n\n" + ("long human review " * 1000),
         ),
     ):
@@ -688,7 +690,7 @@ def test_missing_findings_resolve_only_after_complete_successful_review(
 
 def test_finding_limit_prevents_resolution_of_missing_active_findings(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 3)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 3)
     previous_findings = [
         {"body": f"previous {label}", "path": f"{label}.py", "line_start": 2, "line_end": 2}
         for label in ("a", "b", "c")
@@ -738,7 +740,7 @@ def _chunked_reviewer_with_state(monkeypatch, chunk_sizes, previous=()):
     `old.py` is always there as an ACTIVE finding that no chunk reports again.
     """
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 3)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 3)
     issues = [{"relevant_file": "old.py", "issue_header": "bug", "issue_content": "previous"}]
     issues += [_chunk_issue(chunk, n) for chunk, n, _ in previous]
     state = reconcile_review_findings(
@@ -924,8 +926,8 @@ async def test_run_publishes_state_transition_even_when_review_has_no_suggestion
     async def fake_retry(prepare_fn, model_type=None, git_provider=None):
         reviewer.prediction = "prediction"
 
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets", fake_extract_tickets)
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.retry_with_fallback_models", fake_retry)
 
     await reviewer.run()
 
@@ -939,7 +941,7 @@ async def test_run_publishes_state_transition_even_when_review_has_no_suggestion
 @pytest.mark.asyncio
 async def test_invalid_history_updates_persistent_comment_without_fallback(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", True)
+    monkeypatch.setitem(settings.config, "is_auto_command", True)
     provider = MagicMock()
     provider.get_files.return_value = ["app.py"]
     provider.should_publish_review_as_thread.return_value = False
@@ -962,8 +964,8 @@ async def test_invalid_history_updates_persistent_comment_without_fallback(monke
     async def fake_retry(prepare_fn, model_type=None, git_provider=None):
         reviewer.prediction = "prediction"
 
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets", fake_extract_tickets)
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.retry_with_fallback_models", fake_retry)
 
     await reviewer.run()
 
@@ -997,8 +999,8 @@ async def test_non_marker_state_block_publishes_without_overwriting_state(monkey
     async def fake_retry(prepare_fn, model_type=None, git_provider=None):
         reviewer.prediction = "prediction"
 
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets", fake_extract_tickets)
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.retry_with_fallback_models", fake_retry)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.extract_and_cache_pr_tickets", fake_extract_tickets)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.retry_with_fallback_models", fake_retry)
 
     await reviewer.run()
 
@@ -1109,7 +1111,7 @@ def _large_review_issues(count=10):
 
 async def test_oversized_new_state_keeps_review_publishable_without_marker(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 100)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 100)
     provider = MagicMock()
     provider.get_issue_comments.return_value = []
     provider.get_diff_files.return_value = []
@@ -1119,13 +1121,13 @@ async def test_oversized_new_state_keeps_review_publishable_without_marker(monke
 
     data = {"review": {"key_issues_to_review": _large_review_issues()}}
     with (
-        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value=data),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.load_yaml", return_value=data),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
         patch(
-            "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+            "pr_agent.commands.pr_reviewer.convert_to_markdown_v2",
             return_value=PRReviewHeader.REGULAR.value + " " + chr(0x1F50D) + "\n\nhuman review",
         ),
-        patch("pr_agent.tools.pr_reviewer.push_outputs_async") as push_outputs,
+        patch("pr_agent.commands.pr_reviewer.push_outputs_async") as push_outputs,
     ):
         review = reviewer._prepare_pr_review()
         await reviewer._deliver_sink_output()
@@ -1140,7 +1142,7 @@ async def test_oversized_new_state_keeps_review_publishable_without_marker(monke
 
 def test_oversized_new_state_preserves_previous_valid_marker(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 100)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 100)
     previous = reconcile_review_findings(
         None,
         [_finding("previous state")],
@@ -1161,13 +1163,13 @@ def test_oversized_new_state_preserves_previous_valid_marker(monkeypatch):
 
     data = {"review": {"key_issues_to_review": _large_review_issues()}}
     with (
-        patch("pr_agent.tools.pr_reviewer.load_yaml", return_value=data),
-        patch("pr_agent.tools.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.load_yaml", return_value=data),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
         patch(
-            "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+            "pr_agent.commands.pr_reviewer.convert_to_markdown_v2",
             return_value=header + "\n\n" + ("human review " * 100),
         ),
-        patch("pr_agent.tools.pr_reviewer.push_outputs_async"),
+        patch("pr_agent.commands.pr_reviewer.push_outputs_async"),
     ):
         review = reviewer._prepare_pr_review()
 
@@ -1190,6 +1192,7 @@ async def test_review_publish_uses_shared_full_signature_for_authorship(monkeypa
     provider = GithubProvider.__new__(GithubProvider)
     provider.deployment_type = "user"
     provider.get_files = lambda: ["app.py"]
+    provider.get_diff_files = MagicMock(return_value=[])
     provider.should_publish_review_as_thread = lambda: False
     provider.publish_comment = MagicMock()
     provider.publish_persistent_comment_full = MagicMock(return_value=object())
@@ -1215,11 +1218,11 @@ async def test_review_publish_uses_shared_full_signature_for_authorship(monkeypa
         reviewer.prediction = "prediction"
 
     monkeypatch.setattr(
-        "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+        "pr_agent.commands.pr_reviewer.extract_and_cache_pr_tickets",
         fake_extract_tickets,
     )
     monkeypatch.setattr(
-        "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+        "pr_agent.commands.pr_reviewer.retry_with_fallback_models",
         fake_retry,
     )
 
@@ -1263,7 +1266,7 @@ def test_providers_without_override_inherit_persistent_comment_implementation():
 
 async def test_oversized_state_degradation_is_safe_on_the_next_run(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 100)
+    monkeypatch.setitem(settings.pr_reviewer, "num_max_findings", 100)
     previous = reconcile_review_findings(
         None,
         [_finding("previous state")],
@@ -1285,13 +1288,13 @@ async def test_oversized_state_degradation_is_safe_on_the_next_run(monkeypatch):
 
     async def run_review(reviewer):
         with (
-            patch("pr_agent.tools.pr_reviewer.load_yaml", return_value=data),
-            patch("pr_agent.tools.pr_reviewer.github_action_output"),
+            patch("pr_agent.commands.pr_reviewer.load_yaml", return_value=data),
+            patch("pr_agent.commands.pr_reviewer.github_action_output"),
             patch(
-                "pr_agent.tools.pr_reviewer.convert_to_markdown_v2",
+                "pr_agent.commands.pr_reviewer.convert_to_markdown_v2",
                 return_value=header + "\n\n" + ("human review " * 100),
             ),
-            patch("pr_agent.tools.pr_reviewer.push_outputs_async") as push_outputs,
+            patch("pr_agent.commands.pr_reviewer.push_outputs_async") as push_outputs,
         ):
             review = reviewer._prepare_pr_review()
             await reviewer._deliver_sink_output()
@@ -1330,6 +1333,9 @@ class _ReviewRunProvider:
 
     def get_files(self):
         return ["app.py"]
+
+    def get_diff_files(self):
+        return []
 
     def should_publish_review_as_thread(self):
         return False
@@ -1432,11 +1438,11 @@ def _patch_run_dependencies(monkeypatch, reviewer):
         reviewer.prediction = "prediction"
 
     monkeypatch.setattr(
-        "pr_agent.tools.pr_reviewer.extract_and_cache_pr_tickets",
+        "pr_agent.commands.pr_reviewer.extract_and_cache_pr_tickets",
         fake_extract_tickets,
     )
     monkeypatch.setattr(
-        "pr_agent.tools.pr_reviewer.retry_with_fallback_models",
+        "pr_agent.commands.pr_reviewer.retry_with_fallback_models",
         fake_retry,
     )
 
@@ -1451,7 +1457,7 @@ async def test_review_without_lifecycle_capability_uses_ordinary_persistent_revi
     monkeypatch, provider_class
 ):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", True, raising=False)
+    monkeypatch.setitem(settings.config, "is_auto_command", True)
     provider = _ReviewRunProvider(supports_state=False)
     provider.supports_review_finding_state = (
         provider_class.supports_review_finding_state.__get__(
@@ -1481,13 +1487,8 @@ async def test_review_without_lifecycle_capability_uses_ordinary_persistent_revi
 @pytest.mark.asyncio
 async def test_disabled_finding_state_uses_ordinary_persistent_review(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", True, raising=False)
-    monkeypatch.setattr(
-        settings.pr_reviewer,
-        "persistent_finding_state",
-        False,
-        raising=False,
-    )
+    monkeypatch.setitem(settings.config, "is_auto_command", True)
+    monkeypatch.setitem(settings.pr_reviewer, "persistent_finding_state", False, )
     provider = _ReviewRunProvider(supports_state=True, authored=True)
     provider.publish_persistent_comment = MagicMock(return_value=object())
     provider.publish_persistent_comment_full = MagicMock()
@@ -1505,11 +1506,8 @@ async def test_disabled_finding_state_uses_ordinary_persistent_review(monkeypatc
 
 def test_github_check_setting_does_not_disable_non_check_provider_lifecycle(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.github, "publish_as_check_run", True)
-    monkeypatch.setattr(
-        settings.azure_devops_server, "agent_identity",
-        "11111111-1111-1111-1111-111111111111", raising=False,
-    )
+    monkeypatch.setitem(settings.github, "publish_as_check_run", True)
+    monkeypatch.setitem(settings.azure_devops_server, "agent_identity", "11111111-1111-1111-1111-111111111111", )
     provider = AzureDevopsProvider.__new__(AzureDevopsProvider)
     reviewer = _reviewer_for_run(provider)
 
@@ -1522,8 +1520,8 @@ async def test_review_check_run_fallback_preserves_authorship_contract(
     monkeypatch, check_run_result
 ):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", True, raising=False)
-    monkeypatch.setattr(settings.github, "publish_as_check_run", True)
+    monkeypatch.setitem(settings.config, "is_auto_command", True)
+    monkeypatch.setitem(settings.github, "publish_as_check_run", True)
     forged_body = add_pr_review_identity("forged review", PRReviewIdentity.REGULAR.value)
     forged = SimpleNamespace(body=forged_body, user=SimpleNamespace(login="human"))
     provider = _ReviewRunCheckProvider(check_run_result, comments=[forged])
@@ -1595,10 +1593,8 @@ async def test_review_run_does_not_edit_forged_persistent_comment_without_author
 async def test_review_run_surfaces_failed_persistent_write(
         monkeypatch, is_auto_command, publish_review_failure_comment):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", is_auto_command, raising=False)
-    monkeypatch.setattr(
-        settings.pr_reviewer, "publish_review_failure_comment", publish_review_failure_comment, raising=False
-    )
+    monkeypatch.setitem(settings.config, "is_auto_command", is_auto_command)
+    monkeypatch.setitem(settings.pr_reviewer, "publish_review_failure_comment", publish_review_failure_comment)
     old_body = add_pr_review_identity(
         "previous review", PRReviewIdentity.REGULAR.value
     )
@@ -1639,8 +1635,8 @@ async def test_review_run_surfaces_failed_persistent_write(
 async def test_a_successful_run_is_not_recorded_as_failed(monkeypatch, is_auto_command):
     """The control: recording on failure must not turn every run into a failure."""
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", is_auto_command, raising=False)
-    monkeypatch.setattr(settings.pr_reviewer, "publish_review_failure_comment", False)
+    monkeypatch.setitem(settings.config, "is_auto_command", is_auto_command)
+    monkeypatch.setitem(settings.pr_reviewer, "publish_review_failure_comment", False)
     provider = _ReviewRunProvider(comments=[], supports_state=True, authored=True)
     reviewer = _reviewer_for_run(provider)
     reviewer._review_state_result = SimpleNamespace(changed=True)
@@ -1668,8 +1664,8 @@ async def test_successful_persistence_is_not_failed_by_optional_status_result(
     monkeypatch, status_result
 ):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", True, raising=False)
-    monkeypatch.setattr(settings.pr_reviewer, "final_update_message", True)
+    monkeypatch.setitem(settings.config, "is_auto_command", True)
+    monkeypatch.setitem(settings.pr_reviewer, "final_update_message", True)
     old_body = add_pr_review_identity("old review", PRReviewIdentity.REGULAR.value)
     old_comment = SimpleNamespace(body=old_body)
 
@@ -1699,8 +1695,8 @@ async def test_successful_persistence_is_not_failed_by_optional_status_result(
 @pytest.mark.asyncio
 async def test_persistent_publish_exception_is_visible_for_auto_review(monkeypatch):
     settings = _settings(monkeypatch)
-    monkeypatch.setattr(settings.config, "is_auto_command", True, raising=False)
-    monkeypatch.setattr(settings.config, "propagate_tool_errors", False, raising=False)
+    monkeypatch.setitem(settings.config, "is_auto_command", True)
+    monkeypatch.setitem(settings.config, "propagate_command_errors", False)
     old_body = add_pr_review_identity("old review", PRReviewIdentity.REGULAR.value)
     old_comment = SimpleNamespace(body=old_body)
 
@@ -1757,7 +1753,7 @@ def test_previous_findings_context_gives_the_model_its_earlier_wording(monkeypat
     assert (normalize_finding(PRReviewer._review_finding_from_issue(repeated))["finding_id"]
             == normalize_finding(PRReviewer._review_finding_from_issue(issue))["finding_id"])
 
-    monkeypatch.setattr(settings.pr_reviewer, "max_previous_findings_chars", 0, raising=False)
+    monkeypatch.setitem(settings.pr_reviewer, "max_previous_findings_chars", 0)
     assert reviewer._load_previous_findings_context() == ""
 
 
@@ -1777,7 +1773,6 @@ async def test_incremental_fallback_to_full_review_loads_previous_findings(monke
     _settings(monkeypatch)
     provider = MagicMock()
     reviewer = _reviewer_for_run(provider)
-    reviewer.is_auto = False
     reviewer.incremental = SimpleNamespace(is_incremental=True, commits_range=None)
     reviewer._load_previous_findings_context = MagicMock(return_value="[stored findings]")
     _patch_run_dependencies(monkeypatch, reviewer)
@@ -1800,9 +1795,9 @@ async def test_previous_findings_are_dropped_when_they_do_not_fit_the_model(monk
             raise FallbackEligibleError("no room")
         return raw_vars, MagicMock()
 
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.fit_related_tickets_to_prompt_budget", fit)
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.fit_related_tickets_to_prompt_budget", fit)
     # Unprocessed files keep an empty diff a fallback case; a fully filtered PR skips instead.
-    monkeypatch.setattr("pr_agent.tools.pr_reviewer.get_pr_diff", lambda *_args, **_kwargs: ("", ["app.py"]))
+    monkeypatch.setattr("pr_agent.commands.pr_reviewer.get_pr_diff", lambda *_args, **_kwargs: ("", ["app.py"]))
 
     with pytest.raises(FallbackEligibleError, match="No PR diff"):
         await PRReviewer._prepare_prediction(reviewer, "small-model")
@@ -1845,3 +1840,35 @@ def test_render_previous_findings_uses_exact_json_length_for_unicode_and_escapes
     shorter = json.loads(render_previous_findings(state, len(full) - 1))
     assert [entry["relevant_file"] for entry in shorter] == ["src/中文.py"]
     assert shorter[0]["issue_content"] == 'A "quoted" line\nEmoji 🙂'
+
+
+@pytest.mark.parametrize("threshold,expect_resolution", [(0, True), (5, False)])
+def test_low_confidence_filtering_prevents_resolution(monkeypatch, threshold, expect_resolution):
+    settings = _settings(monkeypatch)
+    monkeypatch.setitem(settings.pr_reviewer, "min_finding_confidence", threshold)
+    previous = reconcile_review_findings(
+        None,
+        [_finding()],
+        allow_resolution=True,
+        head_sha="head-1",
+        timestamp="2026-01-01T00:00:00Z",
+    ).state
+    old_body = f"{PRReviewHeader.REGULAR.value} 🔍\n\nold review\n\n{serialize_review_state(previous)}"
+    provider = MagicMock()
+    provider.last_commit_id = "head-2"
+    provider.get_issue_comments.return_value = [SimpleNamespace(body=old_body)]
+    provider.get_diff_files.return_value = []
+    provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
+    reviewer = _reviewer(provider)
+    low_confidence = {"relevant_file": "other.py", "issue_content": "maybe a problem", "confidence": 1}
+
+    with (
+        patch("pr_agent.commands.pr_reviewer.load_yaml",
+              return_value={"review": {"key_issues_to_review": [low_confidence]}}),
+        patch("pr_agent.commands.pr_reviewer.github_action_output"),
+        patch("pr_agent.commands.pr_reviewer.convert_to_markdown_v2", return_value="review"),
+    ):
+        reviewer._prepare_pr_review()
+
+    assert reviewer.low_confidence_filtered_count == (0 if expect_resolution else 1)
+    assert bool(reviewer._review_state_result.resolved_ids) is expect_resolution

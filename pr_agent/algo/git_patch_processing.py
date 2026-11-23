@@ -85,7 +85,7 @@ def decode_if_bytes(original_file_str):
 def should_skip_patch(filename):
     patch_extension_skip_types = normalize_setting_list(get_settings().config.patch_extension_skip_types)
     if patch_extension_skip_types and filename:
-        return any(filename.endswith(skip_type) for skip_type in patch_extension_skip_types)
+        return any(filename.lower().endswith(str(skip_type).lower()) for skip_type in patch_extension_skip_types)
     return False
 
 
@@ -95,9 +95,24 @@ def process_patch_lines(patch_str, original_file_str, patch_extra_lines_before, 
     patch_extra_lines_before_dynamic = get_settings().config.max_extra_lines_before_dynamic_context
 
     file_original_lines = split_diff_lines(original_file_str)
-    file_new_lines = split_diff_lines(new_file_str) if new_file_str else []
     len_original_lines = len(file_original_lines)
     patch_lines = split_diff_lines(patch_str)
+    # Head lines are only consulted before each hunk, never after it.
+    # Zero-length head hunks point to the line preceding an insertion/deletion.
+    head_prefix_lines = max((
+        max(0, int(match.group(3)) - 1 + (match.group(4) == "0"))
+        for line in patch_lines if (match := RE_HUNK_HEADER.match(line))
+    ), default=0)
+    file_new_lines = []
+    if new_file_str and head_prefix_lines:
+        end = 0
+        for _ in range(head_prefix_lines):
+            next_end = new_file_str.find('\n', end)
+            if next_end < 0:
+                end = len(new_file_str)
+                break
+            end = next_end + 1
+        file_new_lines = split_diff_lines(new_file_str[:end])
     extended_patch_lines = []
     hunk_starts = [(i, int(match.group(1))) for i, line in enumerate(patch_lines)
                    if (match := RE_HUNK_HEADER.match(line))]
@@ -217,10 +232,9 @@ def process_patch_lines(patch_str, original_file_str, patch_extra_lines_before, 
                                         found_mini_match = True
                                         break
                                 if not found_mini_match:
-                                    extended_start1 = start1
-                                    extended_size1 = size1
-                                    extended_start2 = start2
-                                    extended_size2 = size2
+                                    extended_start1, extended_size1, extended_start2, extended_size2 = (
+                                        _calc_context_limits(0)
+                                    )
                                     delta_lines_original = []
                                     # get_logger().debug(f"Extra lines before hunk are different",
                                     #                    artifact={"delta_lines_original": delta_lines_original,
@@ -377,8 +391,9 @@ def handle_patch_deletions(patch: str, original_file_content_str: str,
             get_logger().info(f"Processing file: {file_name}, minimizing deletion file")
         patch = None # file was deleted
     else:
-        patch_lines = split_diff_lines(patch)
-        patch_new = omit_deletion_hunks(patch_lines)
+        # ---/+++ file headers would count as an added line and keep every deletion hunk
+        patch_lines = split_diff_lines(to_hunk_only_patch(patch))
+        patch_new = omit_deletion_hunks(patch_lines) or '\n'.join(patch_lines)
         if patch_new and patch != patch_new:
             if get_verbosity_level() > 0:
                 get_logger().info(f"Processing file: {file_name}, hunks were deleted")
@@ -520,7 +535,8 @@ __old hunk__
 
 
 def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, side,
-                                  remove_trailing_chars: bool = True) -> tuple[str, str]:
+                                  remove_trailing_chars: bool = True,
+                                  start_side: str | None = None) -> tuple[str, str]:
     try:
         try:
             line_start = int(line_start)
@@ -535,10 +551,16 @@ def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, s
         patch_with_lines_str = f"\n\n## File: '{file_name.strip()}'\n\n"
         selected_lines = ""
         patch_lines = split_diff_lines(patch)
+        side_lower = (side or "").lower()
+        start_side_lower = (start_side or "").lower()
+        if start_side_lower not in ("left", "right"):
+            start_side_lower = side_lower
+        mixed_sides = side_lower in ("left", "right") and start_side_lower != side_lower
         match = None
         start1, size1, start2, size2 = -1, -1, -1, -1
         skip_hunk = False
         selected_lines_num = 0
+        left_pos = right_pos = 0
         for line in patch_lines:
             if line == NO_NEWLINE_AT_EOF_MARKER:
                 continue
@@ -555,22 +577,49 @@ def extract_hunk_lines_from_patch(patch: str, file_name, line_start, line_end, s
                 header_line = line
 
                 section_header, size1, size2, start1, start2 = extract_hunk_headers(match)
+                left_pos = start1 + (1 if size1 == 0 else 0)
+                right_pos = start2 + (1 if size2 == 0 else 0)
 
                 # keep every hunk that overlaps the requested line range, so a
                 # range spanning multiple hunks is not silently truncated
-                if side.lower() == 'left':
+                if mixed_sides:
+                    if start_side_lower == "left":
+                        hunk_end_start = start1 + size1 - 1 if size1 > 0 else start1
+                        hunk_start_end = start2 if size2 > 0 else start2 + 1
+                    else:
+                        hunk_end_start = start2 + size2 - 1 if size2 > 0 else start2
+                        hunk_start_end = start1 if size1 > 0 else start1 + 1
+                    if not (line_start > 0 and line_end > 0
+                            and line_start <= hunk_end_start and hunk_start_end <= line_end):
+                        skip_hunk = True
+                        continue
+                elif side_lower == 'left':
                     if not (size1 > 0 and line_end >= start1 and line_start <= start1 + size1 - 1):
                         skip_hunk = True
                         continue
-                elif side.lower() == 'right':
+                elif side_lower == 'right':
                     if not (size2 > 0 and line_end >= start2 and line_start <= start2 + size2 - 1):
                         skip_hunk = True
                         continue
                 patch_with_lines_str += f'\n{header_line}\n'
 
             elif not skip_hunk:
-                side_lower = side.lower()
-                if side_lower in ("left", "right"):
+                if mixed_sides:
+                    if match is None:
+                        continue
+                    if start_side_lower == "left":
+                        started = left_pos > line_start if line.startswith("+") else left_pos >= line_start
+                        not_ended = right_pos <= line_end
+                    else:
+                        started = right_pos > line_start if line.startswith("-") else right_pos >= line_start
+                        not_ended = left_pos <= line_end
+                    if started and not_ended:
+                        selected_lines += line + '\n'
+                    if not line.startswith("+"):
+                        left_pos += 1
+                    if not line.startswith("-"):
+                        right_pos += 1
+                elif side_lower in ("left", "right"):
                     is_left = side_lower == "left"
                     hunk_start = start1 if is_left else start2
                     line_exists_on_side = not line.startswith("+" if is_left else "-")

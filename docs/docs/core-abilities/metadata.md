@@ -9,15 +9,15 @@ sidebar_position: 6
 
    - PR title and branch name
    - PR original description
-   - Commit messages history
+   - Commit messages history (GitHub, GitLab, Gitea and Gerrit; the other providers send none). `/review` and `/improve` get them too; set `config.max_commits_tokens = -1` to leave them out.
    - PR diff patches, in [hunk diff](https://loicpefferkorn.net/2014/02/diff-files-what-are-hunks-and-how-to-extract-them/) format
    - The entire content of the files that were modified in the PR
 
    :::note[Tip: Organization-level metadata]
-   In addition to the inputs above, PR-Agent can incorporate supplementary preferences provided by the user, like [`extra_instructions` and `organization best practices`](../tools/improve.mdx#extra-instructions-and-best-practices). This information can be used to enhance the PR analysis.
+   In addition to the inputs above, PR-Agent can incorporate supplementary preferences provided by the user, like [`extra_instructions`](../commands/review.md#extra-instructions). This information can be used to enhance the PR analysis.
    :::
 
-2. By default, the first command that PR-Agent executes is [`describe`](../tools/describe.md), which generates three types of outputs:
+2. By default, the first command that PR-Agent executes is [`describe`](../commands/describe.md), which generates three types of outputs:
 
    - PR Type (e.g. bug fix, feature, refactor, etc)
    - PR Description - a bullet point summary of the PR

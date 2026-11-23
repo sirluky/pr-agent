@@ -6,7 +6,7 @@ import copy
 import json
 import os
 import re
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, urlsplit
 
 import uvicorn
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -28,10 +28,10 @@ from pr_agent.git_providers.azuredevops_provider import AZURE_AGENT_RESPONSE_MAR
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.servers.request_body_limit import create_server_app
-from pr_agent.servers.utils import basic_auth_matches, get_pr_commands
+from pr_agent.servers.utils import auto_feedback_disabled, basic_auth_matches, dedupe_review_commands, get_pr_commands
 from pr_agent.telemetry.prometheus import attach_metrics_endpoint, prometheus_metrics_enabled
 
-setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "DEBUG"))
+setup_logger(fmt=LoggingFormat.JSON, level=get_settings().get("CONFIG.LOG_LEVEL", "INFO"))
 security = HTTPBasic(auto_error=False)
 router = APIRouter()
 available_commands_rgx = re.compile(r"^\/(" + "|".join(command2class.keys()) + r")\s*")
@@ -69,10 +69,10 @@ async def handle_request_comment(url: str, body: str, thread_id: int, comment_id
             is_question = body.startswith("/ask")
             handled = await agent.handle_request(
                 url, body, notify=lambda: provider.reply_to_thread(thread_id, "On it! ⏳", True),
-                # A tool that fails internally returns normally while `propagate_tool_errors` is
+                # A command that fails internally returns normally while `propagate_command_errors` is
                 # false, and then a resolved discussion thread plus a deleted progress comment would
                 # read as "review done" for a review that was never published.
-                propagate_tool_errors=True)
+                propagate_command_errors=True)
             if handled is RequestOutcome.SKIPPED:
                 return
             if handled and not is_question:
@@ -133,8 +133,9 @@ def handle_line_comment(body: str, thread_id: int, comment_id: int, provider: Az
         return None
     body = body.strip()
     cli_args = ""
-    if body == "/ask" or body.startswith("/ask "):
-        cli_args, question = _split_leading_cli_args(body[5:])
+    parts = body.split(maxsplit=1)
+    if parts and parts[0] in ("/ask", "/ask_question"):
+        cli_args, question = _split_leading_cli_args(parts[1] if len(parts) > 1 else "")
     elif available_commands_rgx.match(body):
         return body
     else:
@@ -167,6 +168,13 @@ def handle_line_comment(body: str, thread_id: int, comment_id: int, provider: Az
         side = "right"
     else:
         get_logger().info("No line range found in thread context", artifact={"thread_context": thread_context})
+        if isinstance(path, str) and path.strip():
+            # A thread on a whole file: PRQuestions reads the file and the thread from the request context
+            # and answers from that file's diff, in this thread.
+            context["file_question_path"] = path
+            context["file_question_comment_id"] = thread_id
+            context["file_question_origin_comment_id"] = comment_id
+            context["file_question_comment_url"] = f"{provider.get_pr_url()}?discussionId={thread_id}"
         return threaded_question
 
     start_line = getattr(start_position, "line", None)
@@ -212,7 +220,7 @@ def authorize(credentials: HTTPBasicCredentials = Depends(security)):  # noqa: B
 async def _perform_commands_azure(commands_conf: str, agent: PRAgent, api_url: str, log_context: dict):
     apply_repo_settings(api_url)
     # auto commands for PR, and auto feedback is disabled
-    if commands_conf == "pr_commands" and get_settings().config.disable_auto_feedback:
+    if auto_feedback_disabled():
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}", **log_context)
         return
     commands = (
@@ -220,6 +228,8 @@ async def _perform_commands_azure(commands_conf: str, agent: PRAgent, api_url: s
         if commands_conf == "pr_commands"
         else get_settings().get(f"azure_devops_server.{commands_conf}")
     )
+    if commands:
+        commands = dedupe_review_commands(commands)
     if not commands:
         return
 
@@ -256,7 +266,7 @@ def _created_event_pr_url(data):
     if not isinstance(href, str):
         return None
     if href:
-        return unquote(href.replace("_apis/git/repositories", "_git"))
+        return href.replace("_apis/git/repositories", "_git")
 
     repository = resource["repository"]
     project = repository["project"]["name"]
@@ -300,7 +310,7 @@ async def handle_request_azure(data, log_context):
                 and (available_commands_rgx.match(comment_content) or extract_azure_mention(comment_content))):
             if data["resourceVersion"] == "2.0":
                 repo = data["resource"]["pullRequest"]["repository"]["webUrl"]
-                pr_url = unquote(f'{repo}/pullrequest/{data["resource"]["pullRequest"]["pullRequestId"]}')
+                pr_url = f'{repo}/pullrequest/{data["resource"]["pullRequest"]["pullRequestId"]}'
                 action = comment["content"]
                 thread_url = comment["_links"]["threads"]["href"]
                 thread_id = int(thread_url.split("/")[-1])

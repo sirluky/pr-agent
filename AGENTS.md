@@ -16,7 +16,7 @@ This file is the shared source of repository guidance for coding agents. Tool-sp
 PR-Agent automates AI-assisted reviews for pull requests across multiple git providers.
 
 - `pr_agent/agent/` orchestrates commands (`review`, `describe`, `improve`, etc.) via `pr_agent/agent/pr_agent.py`.
-- `pr_agent/tools/` implements individual capabilities such as reviewers, code suggestions, docs updates, and label generation.
+- `pr_agent/commands/` implements individual capabilities such as reviewers, code suggestions, docs updates, and label generation.
 - `pr_agent/algo/` contains shared algorithms, model handlers, prompt/token handling, types, and utilities.
 - `pr_agent/git_providers/` handles integrations with GitHub, GitLab, Bitbucket (cloud and server), Azure DevOps, Gitea, Gerrit, CodeCommit, local checkouts, and plain diffs; `pr_agent/identity_providers/` handles identity and `pr_agent/secret_providers/` handles secrets.
 - `pr_agent/settings/` stores Dynaconf defaults (prompts, configuration templates, ignore lists) respected at runtime; `.pr_agent.toml` overrides repository-level behavior.
@@ -28,19 +28,19 @@ PR-Agent automates AI-assisted reviews for pull requests across multiple git pro
 
 ## Architecture and Request Flow
 
-PR-Agent is a CLI/server that runs AI-powered tools (`/review`, `/describe`, `/improve`, `/ask`, etc.) against pull requests on supported git providers or local input. The main dispatch flow is `pr_agent/agent/pr_agent.py` → `command2class` → a tool class under `pr_agent/tools/`.
+PR-Agent is a CLI/server that runs AI-powered commands (`/review`, `/describe`, `/improve`, `/ask`, etc.) against pull requests on supported git providers or local input. The main dispatch flow is `pr_agent/agent/pr_agent.py` → `command2class` → a command class under `pr_agent/commands/`.
 
-A tool generally obtains the appropriate git provider, gathers pull-request context, prepares prompt variables and templates, calls the configured model handler, and publishes or stores the result through the provider.
+A command generally obtains the appropriate git provider, gathers pull-request context, prepares prompt variables and templates, calls the configured model handler, and publishes or stores the result through the provider.
 
 ### Prompt Building
 
-Prompt-driven tools generally construct a `self.vars` dictionary and pass it with the system/user prompt strings to `TokenHandler`. Prompt rendering uses Jinja2 with `StrictUndefined`, so variables referenced by a template should be present in the corresponding vars dictionary; define optional values explicitly and guard optional sections with Jinja conditionals.
+Prompt-driven commands generally construct a `self.vars` dictionary and pass it with the system/user prompt strings to `TokenHandler`. Prompt rendering uses Jinja2 with `StrictUndefined`, so variables referenced by a template should be present in the corresponding vars dictionary; define optional values explicitly and guard optional sections with Jinja conditionals.
 
-System/user prompt strings live as TOML files under `pr_agent/settings/` and are loaded into `global_settings` by `pr_agent/config_loader.py`. Tool and prompt names normally correspond, for example:
+System/user prompt strings live as TOML files under `pr_agent/settings/` and are loaded into `global_settings` by `pr_agent/config_loader.py`. Command and prompt names normally correspond, for example:
 
 - `pr_reviewer.py` ↔ `pr_reviewer_prompts.toml`
 - `pr_description.py` ↔ `pr_description_prompts.toml`
-- `pr_code_suggestions.py` ↔ `code_suggestions/pr_code_suggestions_prompts.toml` (plus its related variants)
+- `pr_questions.py` ↔ `pr_questions_prompts.toml`
 
 New prompt files must also be registered in the `settings_files=[...]` list in `pr_agent/config_loader.py` or they will not be loaded into `global_settings`.
 
@@ -49,6 +49,8 @@ New prompt files must also be registered in the `settings_files=[...]` list in `
 Use `get_settings()` from `pr_agent/config_loader.py` as the shared settings accessor. It returns the request-scoped Dynaconf object from `starlette_context` when one is present, otherwise the module-level `global_settings` object.
 
 Defaults live in `pr_agent/settings/configuration.toml`. Per-repository overrides come from the repository's `.pr_agent.toml` and are applied by `pr_agent/git_providers/utils.py::apply_repo_settings` before command dispatch. When introducing a configuration section, add its defaults and comments to `configuration.toml` and keep related prompt/config changes synchronized.
+
+When a key's detail belongs in a docs page, keep its `configuration.toml` comment to one line under 160 characters that states what the key does and its allowed values, then point to that page.
 
 `docs/docs/usage-guide/configuration_reference.md` is generated from `configuration.toml` by `python scripts/generate_config_reference.py [output_path]` (run from the repository root), and its header says not to edit it by hand. Write the output to a temporary path and diff it against the page before replacing anything. `tests/unittest/test_config_reference.py` checks that the page matches the generator output, lists exactly the active keys, and asserts a hard-coded active-key count, so update that count when adding or removing keys.
 
@@ -69,7 +71,7 @@ Sensitive values should stay in environment variables or the gitignored `.secret
 - Install dependencies (runtime + dev) into a project virtualenv from the lockfile with `uv sync` using a uv version that satisfies `tool.uv.required-version` in `pyproject.toml`; `uv run` auto-syncs before each command.
 - Run a single unit test (verified): `PYTHONPATH=. uv run pytest tests/unittest/test_output_models.py -q`.
 - Run the full unit suite: `PYTHONPATH=. uv run pytest tests/unittest -v`.
-- CI also runs `uv run pytest -q tests/packaging/test_help_docs_package.py`; it is outside `testpaths`, so the unit suite does not cover it. The distribution-contract test asserts the exact uv version given by the lower bound of `tool.uv.required-version` in `pyproject.toml`; newer uv versions can fail that assertion.
+- CI also runs `uv run pytest -q tests/packaging/test_help_docs_package.py`; it is outside `testpaths`, so the unit suite does not cover it. The distribution-contract test checks that the installed uv version satisfies `tool.uv.required-version` in `pyproject.toml`.
 - Execute the CLI locally once dependencies and API keys are available: `uv run pr-agent --pr_url <https://host/org/repo/pull/123> review`.
 - Build the test Docker target mirror of CI when containerizing: `docker build -f docker/Dockerfile --target test .` (loads dev dependencies and copies `tests/`).
 - Build the documentation the same way CI does (Node.js 22): `npm ci` then `npm run build` from `docs/`; `npm start` serves a live preview. After building, run `python3 scripts/check_docs_urls.py` from the repository root to check `docs/build` as CI does. The `docs-ci` workflow publishes `docs/build` to GitHub Pages.
@@ -79,7 +81,7 @@ Sensitive values should stay in environment variables or the gitignored `.secret
 Ruff is the single linting tool: `pyproject.toml` configures it and the pre-commit Ruff hook enforces it (Flake8 and the standalone isort hook have been removed).
 
 - Keep Python lines within the 120-character limit declared in `pyproject.toml`.
-- `pyproject.toml` configures Ruff rules `E`, `F`, `B`, `I`, `UP` and `FURB`. Within the files touched by the task, fix lint violations rather than adding ignore entries. Remove corresponding ignore entries only when they are no longer needed, and preserve intentional exceptions.
+- `pyproject.toml` configures Ruff rules `E`, `F`, `B`, `I`, `UP`, `FURB`,  `PERF` and `PLE`. Within the files touched by the task, fix lint violations rather than adding ignore entries. Remove corresponding ignore entries only when they are no longer needed, and preserve intentional exceptions.
 - Before committing, run `uv run ruff check --fix <paths>` on the Python files you touched and fix every issue it reports. Keep fixes mechanical (rename, remove unused imports, sort imports); do not alter program logic while cleaning up — if a lint fix would change behavior, surface it instead of applying it silently.
 - `.pre-commit-config.yaml` is the source of truth for enabled pre-commit hooks. Run them on the files you touched with `uvx pre-commit run --files <paths>` and review the automatic edits so unrelated changes are not included. The pre-commit GitHub Actions workflow runs on pull requests, so the hooks are enforced in CI.
 - No general-purpose Python formatter is currently enforced (`ruff format` is deliberately not adopted yet). Preserve the surrounding file's formatting and avoid unrelated rewrites or repository-wide formatting.
@@ -92,7 +94,7 @@ Ruff is the single linting tool: `pyproject.toml` configures it and the pre-comm
 
 - Pytest is the standard framework; keep new tests under the closest matching directory (`tests/unittest/` for unit logic, `tests/e2e_tests/` for integration flows, `tests/health_test/` for smoke coverage).
 - Pytest configuration lives in `pyproject.toml`, including `asyncio_mode = "auto"` and `testpaths = ["tests/unittest"]`. The Docker test image keeps `pyproject.toml` at `/app` (uv installs from it), so CI inherits these settings as well. Plain `PYTHONPATH=. uv run pytest` therefore defaults to the unit suite; invoke end-to-end tests explicitly.
-- Prefer focused unit tests that isolate helpers in `pr_agent/algo/`, `pr_agent/tools/`, or provider adapters; use parameterized tests where existing files already do so.
+- Prefer focused unit tests that isolate helpers in `pr_agent/algo/`, `pr_agent/commands/`, or provider adapters; use parameterized tests where existing files already do so.
 - Set `PYTHONPATH=.` when invoking pytest from the repository root to avoid import errors.
 - End-to-end suites require provider credentials and may take several minutes; `TOKEN_GITHUB`, `TOKEN_GITLAB`, `BITBUCKET_USERNAME`, and `BITBUCKET_PASSWORD` are CI secret names, not runtime environment variables (see the mappings in `.github/workflows/e2e_tests.yaml`). These tests create remote branches and pull/merge requests and expect deployed apps/webhooks to process them; run them only when credentials and sandboxes are configured.
 - `tests/health_test/main.py` is a manual script for `/describe`, `/review`, and `/improve`; it asserts artifact headers inline, not checked-in artifact files. Update those inline assertions if prompts change meaningfully. CI provider smoke runs `tests/health_test/test_github_smoke.py` instead (`/describe` only, model stubbed, `GITHUB.USER_TOKEN`).
@@ -109,7 +111,7 @@ Ruff is the single linting tool: `pyproject.toml` configures it and the pre-comm
 - Follow `CONTRIBUTING.md`: keep changes focused, add or update tests, and use Conventional Commit-style messages (e.g., `fix: handle missing repo settings gracefully`).
 - Target branch names follow `feature/<name>` or `fix/<issue>` patterns for substantial work.
 - Reference related issues and update README or docs when user-facing behavior shifts.
-- Before requesting review, run the relevant local checks above and make sure the corresponding CI workflows (`build-and-test`, `pre-commit`) pass; coverage is collected and uploaded by `build-and-test`, and `docs-ci` builds the documentation on every pull request that touches `docs/**` (publishing only on pushes to `main` and `add-docs-portal`). That build fails on broken links and anchors, and also runs `scripts/check_docs_urls.py` to confirm the documentation URLs hardcoded in `pr_agent/` and the README still resolve.
+- Before requesting review, run the relevant local checks above and make sure the corresponding CI workflows (`build-and-test`, `pre-commit`) pass; coverage is collected and uploaded by `build-and-test` except on docs-page-only PRs, which run packaging and documentation checks instead; `docs-ci` builds the documentation on every pull request that touches `docs/**` (publishing only on pushes to `main` and `add-docs-portal`). That build fails on broken links and anchors, and also runs `scripts/check_docs_urls.py` to confirm the documentation URLs hardcoded in `pr_agent/` and the README still resolve.
 - Include screenshots or terminal captures when modifying user-visible output or documentation previews.
 
 ## Safety and Permissions

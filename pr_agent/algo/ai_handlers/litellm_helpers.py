@@ -8,6 +8,7 @@ import httpx
 import litellm
 import openai
 
+from pr_agent.algo.setting_utils import _as_bool_setting
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
@@ -266,7 +267,7 @@ def _process_litellm_extra_body(kwargs: dict) -> dict:
     Raises:
         ValueError: If extra_body contains invalid JSON, unsupported keys, or colliding keys
     """
-    allowed_extra_body_keys = {"processing_mode", "service_tier", "chat_template_kwargs"}
+    allowed_extra_body_keys = {"processing_mode", "service_tier", "chat_template_kwargs", "thinking_token_budget"}
     extra_body = getattr(getattr(get_settings(), "litellm", None), "extra_body", None)
     if extra_body:
         try:
@@ -382,7 +383,7 @@ def _resolve_litellm_callbacks(callback):
                 loggers.append(service_datadog_logger)
         return loggers
     try:
-        import litellm.litellm_core_utils.litellm_logging as litellm_logging
+        from litellm.litellm_core_utils import litellm_logging
     except ImportError:
         return []
     try:
@@ -611,7 +612,9 @@ def litellm_callbacks_registered() -> bool:
     embedding pr-agent can register callbacks without touching configuration.toml.
     """
     litellm_settings = get_settings().get("litellm", {})
-    if litellm_settings and litellm_settings.get("enable_callbacks", False):
+    if litellm_settings and _as_bool_setting(
+        litellm_settings.get("enable_callbacks", False), setting_name="LITELLM.ENABLE_CALLBACKS"
+    ):
         return True
     for name in _LITELLM_CALLBACK_ATTRS:
         registered = getattr(litellm, name, None)

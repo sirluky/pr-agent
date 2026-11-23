@@ -2,6 +2,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import litellm
 import pytest
 
 import pr_agent.algo.token_budget as token_budget_module
@@ -18,6 +19,25 @@ class FakeTokenHandler:
     def count_tokens(self, text):
         self.counted.append(text)
         return len(text)
+
+
+@pytest.mark.parametrize("custom_limit", [0, 20000, "20000"])
+def test_unresolved_model_attempt_requires_explicit_input_limit(monkeypatch, custom_limit):
+    settings = SimpleNamespace(config=SimpleNamespace(custom_model_max_tokens=custom_limit, max_model_tokens=32000))
+    monkeypatch.setattr(token_budget_module, "get_settings", lambda: settings)
+
+    def unavailable_metadata(*_args):
+        if custom_limit:
+            pytest.fail("Explicit input limit must bypass metadata lookup")
+        raise ValueError("Model metadata unavailable")
+
+    monkeypatch.setattr(litellm, "get_model_info", unavailable_metadata)
+    if not custom_limit:
+        with pytest.raises(Exception, match="custom_model_max_tokens"):
+            token_budget_module.AttemptTokenBudget.for_attempt("openrouter/unmapped-model", FakeTokenHandler())
+    else:
+        budget = token_budget_module.AttemptTokenBudget.for_attempt("openrouter/unmapped-model", FakeTokenHandler())
+        assert budget.context_window == 20000
 
 
 @pytest.fixture
@@ -177,7 +197,7 @@ def test_input_token_limit_uses_attempt_reserve_and_extra_headroom(monkeypatch):
     assert budget.input_token_limit(100, additional_input_reserve=True) == 750
 
 
-@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"])
 @pytest.mark.parametrize(("prefix", "suffix", "provider"), [
     ("", "", ""), ("openai/", "_thinking", ""), ("azure/openai/", "_thinking", ""),
     ("azure_ai/", "_thinking", ""), ("openrouter/openai/", "_thinking:nitro", ""),
@@ -206,7 +226,7 @@ def test_native_gpt6_input_ceiling_is_independent_of_output_reserve(
     assert budget.require_input_capacity(4096) == expected - 100
 
 
-@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"])
 def test_gpt6_input_ceiling_applies_with_global_cap_bypass(monkeypatch, model):
     settings = SimpleNamespace(
         config=SimpleNamespace(custom_model_max_tokens=0, max_model_tokens=32000),
@@ -250,7 +270,7 @@ def test_input_ceiling_is_frozen_and_rejects_required_prompt_at_boundary(monkeyp
         budget.require_input_capacity(4096)
 
 
-@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"])
 @pytest.mark.parametrize("provider, ceiling", [("", 922000), ("aiohttp_openai", 922000), ("ollama", None)])
 def test_aiohttp_prefixed_input_budget_honors_actual_route(monkeypatch, model, provider, ceiling):
     settings = SimpleNamespace(

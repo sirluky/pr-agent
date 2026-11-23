@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import hmac
 import re
@@ -11,8 +12,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException
+from starlette_context import context
 
-from pr_agent.algo.setting_utils import normalize_setting_list
+from pr_agent.algo.command_words import split_command_words
+from pr_agent.algo.setting_utils import _as_bool_setting, normalize_setting_list
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
 
@@ -21,13 +24,11 @@ from pr_agent.log import get_logger
 _STANDARD_PR_COMMANDS = (
     "/describe --pr_description.final_update_message=false",
     "/review",
-    "/improve",
 )
-_PLAIN_PR_COMMANDS = ("/describe", "/review", "/improve")
+_PLAIN_PR_COMMANDS = ("/describe", "/review")
 _COMMITTABLE_PR_COMMANDS = (
     "/describe --pr_description.final_update_message=false",
-    "/review",
-    "/improve --pr_code_suggestions.committable_code_suggestions=true",
+    "/review --pr_code_suggestions.committable_code_suggestions=true",
 )
 _DEFAULT_PR_COMMANDS_BY_PROVIDER = {
     "github_app": _STANDARD_PR_COMMANDS,
@@ -43,6 +44,70 @@ _MISSING = object()
 def _ignore_patterns(value):
     """Keep a scalar ignore setting as one pattern rather than its characters."""
     return normalize_setting_list(value)
+
+
+def get_include_pr_labels() -> list[str]:
+    """Keep numeric label names (including zero) active when read from environment settings."""
+    value = get_settings().get("CONFIG.INCLUDE_PR_LABELS", [])
+    if value is None or value == "" or value == []:
+        return []
+    return [str(label) for label in value] if isinstance(value, (list, tuple, set)) else [str(value)]
+
+
+def pin_host_settings_source_for_webhook() -> bool:
+    """Remember the trusted source before an earlier host load can change its URL."""
+    if not context.exists():
+        # Background work without an isolated request must not modify global settings.
+        return False
+    if context.get("automatic_host_settings_source"):
+        return True
+    source = get_settings().get("CONFIG.EXTRA_CONFIG_URL")
+    if not isinstance(source, str) or not source.strip():
+        return False
+
+    # Some webhook entry points create a request context without preloading
+    # settings. Never merge external host TOML into process-wide settings.
+    if context.get("settings") is None:
+        context["settings"] = copy.deepcopy(get_settings(use_context=False))
+    # Remember the selected trusted source even when its first read fails.
+    context["automatic_host_settings_source"] = source.strip()
+    return True
+
+
+async def load_host_settings_for_webhook() -> bool:
+    """Apply the trusted external host layer before automatic webhook exclusions."""
+    if context.exists() and context.get("automatic_host_settings_source"):
+        return True
+    if not pin_host_settings_source_for_webhook():
+        return False
+
+    from pr_agent.git_providers.utils import apply_host_settings
+
+    try:
+        await asyncio.to_thread(apply_host_settings)
+    except Exception as error:
+        # An invalid/unreachable external source must not stop approval revocation.
+        # Freeze the failure too, so later repository loads do not hit the same
+        # malformed source again or unexpectedly turn a skipped event into an error.
+        if context.exists():
+            source = context.get("automatic_host_settings_source")
+            if source:
+                context.setdefault("extra_config_payloads", {})[source] = None
+        get_logger().warning(f"Unable to preload Host settings for webhook ({type(error).__name__})")
+    return True
+
+
+def host_settings_unavailable() -> bool:
+    """Return True when this webhook's host settings source was pinned but could not be loaded.
+
+    Call it after ``load_host_settings_for_webhook()``. A failed load leaves ``None`` for the
+    source in the request's payload cache; a source that was never loaded is not a failure.
+    """
+    if not context.exists():
+        return False
+    source = context.get("automatic_host_settings_source")
+    payloads = context.get("extra_config_payloads") or {}
+    return bool(source) and source in payloads and payloads[source] is None
 
 
 def payload_log_summary(data: object, identifying_fields: Sequence[str] = ()) -> dict:
@@ -64,7 +129,7 @@ def is_command_comment(body) -> bool:
     A command comment must start with '/' after leading whitespace, matching the
     check the GitHub app and action already apply. Plain sentences that merely
     begin with a command word ("review looks good to me") must not dispatch a
-    tool, because the dispatcher strips an optional leading slash.
+    command, because the dispatcher strips an optional leading slash.
     """
     return isinstance(body, str) and body.lstrip().startswith("/")
 
@@ -77,21 +142,77 @@ def is_ask_command_comment(body) -> bool:
     dispatcher rejects the unknown "/asking" command, but prefix matching would
     instead rewrite the comment into an /ask_line question whose text is
     "ing about retries". "/ask_line" is the generated command name, so it is
-    accepted as well.
+    accepted as well. Recognize aliases and case as the dispatcher does.
     """
     if not isinstance(body, str):
         return False
     stripped = body.lstrip()
     if not stripped:
         return False
-    return stripped.split(maxsplit=1)[0] in ("/ask", "/ask_line")
+    return stripped.split(maxsplit=1)[0].lower() in ("/ask", "/ask_question", "/ask_line")
+
+
+def auto_feedback_disabled() -> bool:
+    """Whether config.disable_auto_feedback stops every auto command (pr_commands, push_commands, ...)."""
+    return _as_bool_setting(
+        get_settings().get("config.disable_auto_feedback", False),
+        default=True,
+        setting_name="config.disable_auto_feedback",
+    )
+
+
+_REVIEW_COMMAND_NAMES = frozenset({"review", "review_pr", "improve", "improve_code"})
+
+
+def _review_command_tokens(command) -> list[str]:
+    """Words of a /review, /improve or /improve_code entry, quoting kept, or [] for anything else.
+
+    An entry the command parser rejects (an unterminated quote, for instance) stays apart
+    instead of swallowing a valid review entry.
+    """
+    if not isinstance(command, str):
+        return []
+    try:
+        tokens = split_command_words(command)
+    except ValueError:
+        return []
+    return tokens if tokens and tokens[0].lstrip("/").lower() in _REVIEW_COMMAND_NAMES else []
+
+
+def dedupe_review_commands(commands: Sequence[str]) -> list[str]:
+    """Rewrite /improve and /improve_code to /review and keep a single /review entry.
+
+    /improve runs /review, so a list naming both would review twice. The first review entry stays in
+    place and takes the arguments of the removed ones, in order, without repeating an identical argument. Other
+    commands, and entries that are not strings, pass through untouched and in order.
+    """
+    result: list = []
+    review_tokens: list[str] | None = None
+    review_index = -1
+    for command in commands:
+        tokens = _review_command_tokens(command)
+        if not tokens:
+            result.append(command)
+            continue
+        if review_tokens is None:
+            slash = "/" if tokens[0].startswith("/") else ""
+            review_tokens = [f"{slash}review", *tokens[1:]]
+            review_index = len(result)
+            result.append(command)
+            continue
+        review_tokens.extend(token for token in tokens[1:] if token not in review_tokens[1:])
+    if review_tokens is not None:
+        result[review_index] = " ".join(review_tokens)
+    return result
 
 
 def get_pr_commands(provider: str) -> Sequence[str]:
     """Return an explicit provider override or a fresh copy of its default profile."""
     configured = get_settings().get(f"{provider}.pr_commands", _MISSING)
     if configured is not _MISSING:
-        return normalize_setting_list(configured) if isinstance(configured, str) else configured
+        if isinstance(configured, str):
+            configured = normalize_setting_list(configured)
+        return dedupe_review_commands(configured) if configured else configured
     return list(_DEFAULT_PR_COMMANDS_BY_PROVIDER[provider])
 
 
@@ -287,11 +408,20 @@ def _extract_pr_metadata(data: dict, provider: str | None = None):
         if not obj_attr or not isinstance(obj_attr, dict):
             return None
         title = obj_attr.get("title") or ""
-        sender = data.get("user", {}).get("username") or ""
+        actor = data.get("user") or {}
+        if not isinstance(actor, dict):
+            actor = {}
+        sender = actor.get("username") or ""
+        # The actor on an MR update is not necessarily the MR author.
+        if obj_attr.get("author_id") is not None and str(obj_attr["author_id"]) != str(actor.get("id")):
+            sender = ""
         repo_full_name = data.get("project", {}).get("path_with_namespace") or ""
         source_branch = obj_attr.get("source_branch") or ""
         target_branch = obj_attr.get("target_branch") or ""
-        raw_labels = obj_attr.get("labels") or []
+        # GitLab merge request webhooks put labels at the payload root.
+        raw_labels = (data.get("labels") if "labels" in data else obj_attr.get("labels")) or []
+        if not isinstance(raw_labels, (list, tuple)):
+            raw_labels = []
         labels = [
             label.get("title", "") if isinstance(label, dict) else str(label)
             for label in raw_labels
@@ -306,9 +436,10 @@ def _extract_pr_metadata(data: dict, provider: str | None = None):
         source_branch = pr_data.get("source", {}).get("branch", {}).get("name") or ""
         target_branch = pr_data.get("destination", {}).get("branch", {}).get("name") or ""
         repo_full_name = pr_data.get("destination", {}).get("repository", {}).get("full_name") or ""
-        actor = data.get("data", {}).get("actor") or data.get("actor") or {}
-        if isinstance(actor, dict):
-            sender = actor.get("username") or actor.get("display_name") or actor.get("nickname") or ""
+        # The event actor can be a collaborator who pushed to someone else's PR.
+        author = pr_data.get("author") or {}
+        if isinstance(author, dict):
+            sender = author.get("username") or author.get("display_name") or author.get("nickname") or ""
         return title, sender, repo_full_name, labels, source_branch, target_branch
 
     # 3. Bitbucket Server payload
@@ -336,12 +467,16 @@ def _extract_pr_metadata(data: dict, provider: str | None = None):
         source_branch = pull_request.get("head", {}).get("ref") or ""
         target_branch = pull_request.get("base", {}).get("ref") or ""
         pr_labels = pull_request.get("labels") or []
+        if not isinstance(pr_labels, (list, tuple)):
+            pr_labels = []
         labels = [
             label.get("name", "") if isinstance(label, dict) else str(label)
             for label in pr_labels
             if label
         ]
-        sender = data.get("sender", {}).get("login") or ""
+        # The webhook sender may be a collaborator instead of the PR author.
+        pr_author = pull_request.get("user") or {}
+        sender = (pr_author.get("login") or "") if isinstance(pr_author, dict) else ""
         repo_full_name = data.get("repository", {}).get("full_name") or ""
         return title, sender, repo_full_name, labels, source_branch, target_branch
 
@@ -358,11 +493,13 @@ def should_process_pr_logic(
     labels: Sequence[str] | None = None,
     source_branch: str | None = None,
     target_branch: str | None = None,
+    check_include_labels: bool = True,
     raise_on_error: bool = False,
 ) -> bool:
     """Determine whether a pull/merge request should be processed based on configuration.
 
-    Evaluates ignore rules configured in settings:
+    Evaluates PR selection and ignore rules configured in settings:
+      - CONFIG.INCLUDE_PR_LABELS: require at least one exact matching PR/MR label when nonempty
       - CONFIG.IGNORE_REPOSITORIES: regex match on repo_full_name
       - CONFIG.IGNORE_PR_AUTHORS: regex match on sender/author
       - CONFIG.IGNORE_PR_TITLE: regex match on title (supports str or list[str])
@@ -372,6 +509,9 @@ def should_process_pr_logic(
 
     Can be called with a webhook payload dict (`data`), explicit keyword arguments, or both
     (explicit kwargs override extracted payload values).
+
+    Set `check_include_labels=False` only before repository settings have been loaded;
+    the caller must recheck the effective policy afterwards.
 
     When `raise_on_error` is True, exceptions raised during filtering are re-raised so callers
     can distinguish error fallbacks from successful evaluations. Otherwise, returns True.
@@ -403,6 +543,14 @@ def should_process_pr_logic(
         labels = labels or []
         source_branch = source_branch or ""
         target_branch = target_branch or ""
+
+        if check_include_labels:
+            include_pr_labels = get_include_pr_labels()
+            if include_pr_labels:
+                if (not isinstance(labels, Sequence) or isinstance(labels, (str, bytes))
+                        or not any(label in include_pr_labels for label in labels)):
+                    get_logger().info("Skipping PR without a valid label in config.include_pr_labels")
+                    return False
 
         # Ignore PRs from specific repositories
         ignore_repos = _ignore_patterns(get_settings().get("CONFIG.IGNORE_REPOSITORIES", []))
@@ -453,6 +601,9 @@ def should_process_pr_logic(
         get_logger().error(f"Failed 'should_process_pr_logic': {e}")
         if raise_on_error:
             raise
+        # An opt-in allowlist must not be bypassed by malformed webhook metadata.
+        if check_include_labels and get_include_pr_labels():
+            return False
         return True
     return True
 
